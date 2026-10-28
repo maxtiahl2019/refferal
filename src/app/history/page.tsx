@@ -1,0 +1,1099 @@
+'use client'
+
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { ChevronDown, ChevronRight, Undo2, Redo2 } from 'lucide-react'
+import { formatDurationDelta, formatTimeInTimezone } from '@/lib/format-date'
+import { FIELD_LABELS, truncateTitle } from '@/lib/field-labels'
+import { clientLabel } from '@/lib/client-attribution'
+import { getPriorityOption } from '@/lib/priority'
+import { useTimezone } from '@/hooks/useTimezone'
+import { useRequireSession } from '@/hooks/useRequireSession'
+import { PageLoading } from '@/components/PageLoading'
+import { cn } from '@/lib/utils'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { showToast } from '@/lib/toast'
+import dynamic from 'next/dynamic'
+import { DateTime } from 'luxon'
+
+const BatchUndoDialog = dynamic(() =>
+  import('@/components/BatchUndoDialog').then((mod) => ({ default: mod.BatchUndoDialog })),
+)
+import { useUndoRedo } from '@/hooks/useUndoRedo'
+import { useUndoRedoShortcuts } from '@/hooks/useUndoRedoShortcuts'
+import { AIStatusContent, type AIStatusData } from '@/components/AIStatusContent'
+import { useAiFeatureInfo, useDayStart } from '@/components/PreferencesProvider'
+import { openTaskDateSpan, openTaskDayOf } from '@/lib/opentask-day'
+import { formatTimeAgoLabel } from '@/lib/history-time-label'
+import type { Task, UndoAction } from '@/types'
+
+interface CompletionEntry {
+  id: number
+  task_id: number
+  task_title: string
+  completed_at: string
+  due_at_was: string | null
+  /** Local days over target when completed (spec §7); null on older rows. */
+  attempts: number | null
+}
+
+interface UndoSnapshot {
+  task_id: number
+  before_state: Partial<Task>
+  after_state: Partial<Task>
+  completion_id?: number
+}
+
+interface UndoEntry {
+  id: number
+  action: UndoAction
+  description: string | null
+  created_at: string
+  undone: boolean
+  fields_changed: string[]
+  snapshot: UndoSnapshot[]
+  /** Which client made it (`src/lib/client-attribution.ts`); null on older rows. */
+  client?: string | null
+  token_name?: string | null
+}
+
+type TabId = 'completions' | 'activity' | 'ai'
+
+export default function HistoryPage() {
+  const { ready } = useRequireSession()
+  const timezone = useTimezone()
+  // The user's day boundary ("Day starts at" PR 2): a History day is an
+  // OpenTask day — with a 3:00 AM start, 01:30's completions are the day before's.
+  const dayStart = useDayStart()
+  const [tab, setTab] = useState<TabId>('activity')
+  const [completions, setCompletions] = useState<CompletionEntry[]>([])
+  const [activities, setActivities] = useState<UndoEntry[]>([])
+
+  // Read tab from URL on mount (avoids useSearchParams which requires Suspense boundary)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const t = params.get('tab')
+    if (t === 'activity' || t === 'completions' || t === 'ai') setTab(t)
+  }, [])
+
+  const handleTabChange = useCallback((newTab: TabId) => {
+    setTab(newTab)
+    const url = new URL(window.location.href)
+    url.searchParams.set('tab', newTab)
+    window.history.replaceState({}, '', url.toString())
+  }, [])
+  const [activityFetchedAt, setActivityFetchedAt] = useState(0)
+  const [loading, setLoading] = useState(true)
+  // The Completions tab's day (YYYY-MM-DD), an OpenTask date in the account's
+  // timezone. null means "today": it is resolved at render because
+  // useTimezone() returns the browser's zone until the session loads, and a
+  // value captured on the first render would keep that zone's date.
+  const [pickedDate, setDate] = useState<string | null>(null)
+  const date = pickedDate ?? openTaskDayOf(new Date(), timezone, dayStart)
+
+  const fetchActivity = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await fetch('/api/undo/history?limit=50')
+      if (res.ok) {
+        const data = await res.json()
+        setActivities(data.data?.history || [])
+        setActivityFetchedAt(Date.now())
+      }
+    } catch {
+      // Handled silently
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!ready) return
+
+    async function fetchData() {
+      setLoading(true)
+      try {
+        if (tab === 'completions') {
+          // Ask for the account-timezone OpenTask day as an instant range, its
+          // day start to the next. The API's ?date= filter matches the UTC
+          // calendar date, which files an evening completion west of UTC
+          // under the next day.
+          const span = openTaskDateSpan(date, timezone, dayStart)
+          const since = encodeURIComponent(span.start.toISOString())
+          const until = encodeURIComponent(span.end.toISOString())
+          const res = await fetch(`/api/completions?since=${since}&until=${until}`)
+          if (res.ok) {
+            const data = await res.json()
+            setCompletions(data.data?.completions || [])
+          }
+        } else {
+          await fetchActivity()
+          return // fetchActivity already handles setLoading
+        }
+      } catch {
+        // Handled silently
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    fetchData()
+  }, [ready, tab, date, timezone, dayStart, fetchActivity])
+
+  if (!ready) return <PageLoading />
+
+  return (
+    <div className="flex-1">
+      <header className="safe-top bg-background/80 sticky top-0 z-10 border-b backdrop-blur-sm">
+        <div className="mx-auto max-w-2xl px-4 py-3">
+          <h1 className="text-xl font-semibold">History</h1>
+        </div>
+      </header>
+
+      <main className="mx-auto w-full max-w-2xl px-4 py-6">
+        {/* Tab bar */}
+        <div role="tablist" className="bg-muted mb-6 flex gap-1 rounded-lg p-1">
+          <button
+            role="tab"
+            aria-selected={tab === 'activity'}
+            onClick={() => handleTabChange('activity')}
+            className={`flex-1 rounded-md py-2 text-sm font-medium transition-colors ${
+              tab === 'activity'
+                ? 'bg-background shadow-sm'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            Activity
+          </button>
+          <button
+            role="tab"
+            aria-selected={tab === 'completions'}
+            onClick={() => handleTabChange('completions')}
+            className={`flex-1 rounded-md py-2 text-sm font-medium transition-colors ${
+              tab === 'completions'
+                ? 'bg-background shadow-sm'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            Completions
+          </button>
+          <button
+            role="tab"
+            aria-selected={tab === 'ai'}
+            onClick={() => handleTabChange('ai')}
+            className={`flex-1 rounded-md py-2 text-sm font-medium transition-colors ${
+              tab === 'ai'
+                ? 'bg-background shadow-sm'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            AI
+          </button>
+        </div>
+
+        {tab === 'completions' && (
+          <div role="tabpanel">
+            <CompletionsTab
+              date={date}
+              setDate={setDate}
+              loading={loading}
+              completions={completions}
+              timezone={timezone}
+            />
+          </div>
+        )}
+
+        {tab === 'activity' && (
+          <div role="tabpanel">
+            <ActivityTab
+              loading={loading}
+              activities={activities}
+              timezone={timezone}
+              dayStart={dayStart}
+              onRefresh={fetchActivity}
+              now={activityFetchedAt}
+            />
+          </div>
+        )}
+
+        {tab === 'ai' && (
+          <div role="tabpanel">
+            <AITab timezone={timezone} />
+          </div>
+        )}
+      </main>
+    </div>
+  )
+}
+
+function CompletionsTab({
+  date,
+  setDate,
+  loading,
+  completions,
+  timezone,
+}: {
+  date: string
+  setDate: (d: string) => void
+  loading: boolean
+  completions: CompletionEntry[]
+  timezone: string
+}) {
+  return (
+    <div>
+      {/* Date navigation */}
+      <div className="mb-4 flex items-center gap-3">
+        <button
+          onClick={() => setDate(DateTime.fromISO(date).minus({ days: 1 }).toISODate()!)}
+          className="text-muted-foreground hover:bg-accent rounded-lg p-2"
+          aria-label="Previous day"
+        >
+          &larr;
+        </button>
+        <input
+          type="date"
+          value={date}
+          onChange={(e) => {
+            // A cleared picker gives "": keep the current day rather than query nothing
+            if (e.target.value) setDate(e.target.value)
+          }}
+          className="border-border bg-background rounded-lg border px-3 py-1.5 text-sm"
+        />
+        <button
+          onClick={() => setDate(DateTime.fromISO(date).plus({ days: 1 }).toISODate()!)}
+          className="text-muted-foreground hover:bg-accent rounded-lg p-2"
+          aria-label="Next day"
+        >
+          &rarr;
+        </button>
+      </div>
+
+      {loading ? (
+        <div className="text-muted-foreground animate-pulse py-8 text-center">Loading...</div>
+      ) : completions.length === 0 ? (
+        <p className="text-muted-foreground py-8 text-center">No completions for this date.</p>
+      ) : (
+        <div className="space-y-2">
+          {completions.map((c) => (
+            <div key={c.id} className="border-border flex items-center gap-3 rounded-lg border p-3">
+              <span className="text-green-500">&#x2713;</span>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-medium">{c.task_title}</p>
+                <p className="text-muted-foreground text-xs">
+                  {new Date(c.completed_at).toLocaleTimeString('en-US', {
+                    timeZone: timezone,
+                    hour: 'numeric',
+                    minute: '2-digit',
+                    hour12: true,
+                  })}
+                  {/* A late completion says how many days it was over target. */}
+                  {c.attempts !== null && c.attempts > 0 && (
+                    <span
+                      data-completion-attempts={c.attempts}
+                      className="text-over-target ml-1.5 font-semibold tabular-nums"
+                      title={`Overdue on ${c.attempts} day${c.attempts === 1 ? '' : 's'}`}
+                    >
+                      · {c.attempts}×
+                    </span>
+                  )}
+                </p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Format priority value as human-readable string.
+ */
+function formatPriority(value: number | undefined): string {
+  return getPriorityOption(value ?? 0).label
+}
+
+/**
+ * Format a rich activity description based on action type and snapshot data.
+ */
+function formatActivityDescription(entry: UndoEntry, timezone: string): string {
+  const { action, snapshot, fields_changed } = entry
+
+  // Get task title from snapshot (prefer before_state, fall back to after_state)
+  const firstSnapshot = snapshot[0]
+  const taskTitle =
+    firstSnapshot?.before_state?.title || firstSnapshot?.after_state?.title || 'task'
+  const truncatedTitle = truncateTitle(taskTitle, 30)
+
+  // For bulk operations, show count
+  const isBulk = action.startsWith('bulk_')
+  const taskCount = snapshot.length
+
+  switch (action) {
+    case 'done':
+    case 'bulk_done':
+      if (isBulk) {
+        // A batch that also acted on quota prompts (a "Considered all" over a
+        // slot holding both) carries prompt snapshots too, so the snapshot
+        // count is not a task count — its own description says it right.
+        if (entry.description?.includes('Quota reminders')) return entry.description
+        return `Completed ${taskCount} tasks`
+      }
+      return `Completed '${truncatedTitle}'`
+
+    case 'undone':
+      return `Marked '${truncatedTitle}' incomplete`
+
+    case 'snooze':
+    case 'bulk_snooze': {
+      if (isBulk) {
+        // For bulk snooze, show the delta from first task
+        const beforeDue = firstSnapshot?.before_state?.due_at
+        const afterDue = firstSnapshot?.after_state?.due_at
+        if (beforeDue && afterDue) {
+          const delta = formatDurationDelta(
+            new Date(beforeDue).getTime(),
+            new Date(afterDue).getTime(),
+          )
+          return `Deferred ${taskCount} tasks ${delta}`
+        }
+        return `Deferred ${taskCount} tasks`
+      }
+
+      // Single snooze - show duration and time change
+      const beforeDue = firstSnapshot?.before_state?.due_at
+      const afterDue = firstSnapshot?.after_state?.due_at
+      if (beforeDue && afterDue) {
+        const delta = formatDurationDelta(
+          new Date(beforeDue).getTime(),
+          new Date(afterDue).getTime(),
+        )
+        const fromTime = formatTimeInTimezone(beforeDue, timezone)
+        const toTime = formatTimeInTimezone(afterDue, timezone)
+        return `Deferred '${truncatedTitle}' ${delta} (${fromTime} → ${toTime})`
+      }
+      return `Deferred '${truncatedTitle}'`
+    }
+
+    case 'edit':
+    case 'bulk_edit': {
+      if (isBulk) {
+        // Show what fields were edited
+        const fieldList = formatFieldList(fields_changed)
+        return `Edited ${taskCount} tasks: ${fieldList}`
+      }
+
+      // Single edit - show field changes with values
+      const details = formatEditDetails(firstSnapshot, fields_changed, timezone)
+      if (details) {
+        return `Edited '${truncatedTitle}': ${details}`
+      }
+      return `Edited '${truncatedTitle}'`
+    }
+
+    case 'create':
+      return `Created '${truncatedTitle}'`
+
+    case 'delete':
+    case 'bulk_delete':
+      if (isBulk) {
+        return `Deleted ${taskCount} tasks`
+      }
+      return `Deleted '${truncatedTitle}'`
+
+    case 'restore':
+      return `Restored '${truncatedTitle}'`
+
+    default:
+      return entry.description || action
+  }
+}
+
+/**
+ * Format a list of field names for display.
+ */
+function formatFieldList(fields: string[]): string {
+  const displayNames: Record<string, string> = { ...FIELD_LABELS, done: 'status' }
+
+  return fields
+    .map((f) => displayNames[f] || f)
+    .slice(0, 3) // Limit to 3 fields
+    .join(', ')
+}
+
+/**
+ * Format edit details showing before/after values for changed fields.
+ */
+function formatEditDetails(
+  snapshot: UndoSnapshot | undefined,
+  fields: string[],
+  timezone: string,
+): string {
+  if (!snapshot) return ''
+
+  const { before_state, after_state } = snapshot
+  const parts: string[] = []
+
+  for (const field of fields) {
+    switch (field) {
+      case 'priority': {
+        const before = formatPriority(before_state.priority)
+        const after = formatPriority(after_state.priority)
+        if (before !== after) {
+          parts.push(`priority ${before}→${after}`)
+        }
+        break
+      }
+      case 'title': {
+        const beforeTitle = before_state.title
+        const afterTitle = after_state.title
+        if (beforeTitle !== afterTitle && beforeTitle && afterTitle) {
+          // Truncate titles for display
+          const truncBefore = beforeTitle.length > 15 ? beforeTitle.slice(0, 15) + '…' : beforeTitle
+          const truncAfter = afterTitle.length > 15 ? afterTitle.slice(0, 15) + '…' : afterTitle
+          parts.push(`"${truncBefore}"→"${truncAfter}"`)
+        }
+        break
+      }
+      case 'due_at': {
+        const beforeDue = before_state.due_at
+        const afterDue = after_state.due_at
+        if (beforeDue && afterDue) {
+          const fromTime = formatTimeInTimezone(beforeDue, timezone)
+          const toTime = formatTimeInTimezone(afterDue, timezone)
+          parts.push(`due ${fromTime}→${toTime}`)
+        } else if (!beforeDue && afterDue) {
+          parts.push('added due date')
+        } else if (beforeDue && !afterDue) {
+          parts.push('removed due date')
+        }
+        break
+      }
+      case 'done': {
+        if (before_state.done !== after_state.done) {
+          parts.push(after_state.done ? 'completed' : 'incomplete')
+        }
+        break
+      }
+      case 'labels': {
+        const beforeLabels = before_state.labels || []
+        const afterLabels = after_state.labels || []
+        const added = afterLabels.filter((l) => !beforeLabels.includes(l))
+        const removed = beforeLabels.filter((l) => !afterLabels.includes(l))
+        if (added.length > 0 && removed.length === 0) {
+          parts.push(`+${added.join(', ')}`)
+        } else if (removed.length > 0 && added.length === 0) {
+          parts.push(`-${removed.join(', ')}`)
+        } else if (added.length > 0 || removed.length > 0) {
+          parts.push('labels')
+        }
+        break
+      }
+      case 'rrule': {
+        const beforeRrule = before_state.rrule
+        const afterRrule = after_state.rrule
+        if (!beforeRrule && afterRrule) {
+          parts.push('added recurrence')
+        } else if (beforeRrule && !afterRrule) {
+          parts.push('removed recurrence')
+        } else {
+          parts.push('changed recurrence')
+        }
+        break
+      }
+      // Deadline-anchored repeats (2026-10-21): what the schedule's instant is,
+      // and where the target sits before the deadline.
+      case 'repeat_anchor': {
+        const after = after_state.repeat_anchor
+        if (before_state.repeat_anchor !== after) {
+          parts.push(after === 'deadline' ? 'repeats on deadline' : 'repeats on target')
+        }
+        break
+      }
+      // A relative target (a deadline-anchored repeat's; a one-off's since
+      // 2026-10-24): its days before, time and the period it follows are one
+      // setting; cleared beside a picked date, the target became fixed.
+      case 'target_days_before':
+      case 'target_time':
+      case 'target_slot_id': {
+        const cleared =
+          after_state.target_days_before === null && before_state.target_days_before != null
+        const word = cleared ? 'target fixed' : 'target before deadline'
+        if (!parts.includes(word)) parts.push(word)
+        break
+      }
+      // The deadlines page (2026-10-22): the lead override, and this
+      // instance's lead day (moved by the page's Defer, re-derived on a
+      // deadline write — said only when it is the whole change).
+      case 'lead_days':
+        parts.push(
+          after_state.lead_days == null ? 'default lead' : `lead ${after_state.lead_days}d`,
+        )
+        break
+      case 'lead_from':
+        if (fields.length <= 2 && typeof after_state.lead_from === 'string') {
+          parts.push(`on the deadlines page from ${after_state.lead_from}`)
+        }
+        break
+      // Skip internal fields that don't need display
+      case 'anchor_time':
+      case 'anchor_dow':
+      case 'anchor_dom':
+      case 'snoozed_from': // legacy field name
+      case 'original_due_at': // current field name
+      case 'target_set_at': // Upcoming's wait anchor, moves with every target write
+      case 'target_auto': // §8: whether the target is the deadline's automatic one
+      case 'occurrence_at': // §6: a repeating task's schedule, moves with done/skip
+      case 'updated_at':
+        break
+      default:
+        // For unhandled fields, just show the name
+        if (!field.startsWith('anchor_')) {
+          parts.push(field.replace(/_/g, ' '))
+        }
+    }
+  }
+
+  return parts.slice(0, 3).join(', ') // Limit to 3 details
+}
+
+/**
+ * Determines whether to show a separator pill between two adjacent entries.
+ * Threshold adapts based on the age of the older entry (entries are newest-first):
+ * - < 1 hour old: gap > 3 minutes
+ * - 1-2 hours old: gap > 15 minutes
+ * - < 24 hours old: gap > 30 minutes
+ * - 1-3 days old: gap > 3 hours
+ * - 3-7 days old: gap > 6 hours
+ * - > 1 week old: gap > 24 hours (day-level only)
+ */
+function shouldShowSeparator(prev: UndoEntry, current: UndoEntry, now: number): boolean {
+  const prevTime = new Date(prev.created_at).getTime()
+  const currentTime = new Date(current.created_at).getTime()
+  const currentAge = now - currentTime
+  const gap = prevTime - currentTime // positive: prev is newer (list is newest-first)
+
+  const ONE_HOUR = 3_600_000
+  const ONE_DAY = 86_400_000
+
+  let threshold: number
+  if (currentAge < ONE_HOUR) {
+    threshold = 3 * 60_000 // 3 minutes
+  } else if (currentAge < 2 * ONE_HOUR) {
+    threshold = 15 * 60_000 // 15 minutes
+  } else if (currentAge < ONE_DAY) {
+    threshold = 30 * 60_000 // 30 minutes
+  } else if (currentAge < 3 * ONE_DAY) {
+    threshold = 3 * ONE_HOUR // 3 hours
+  } else if (currentAge < 7 * ONE_DAY) {
+    threshold = 6 * ONE_HOUR // 6 hours
+  } else {
+    threshold = ONE_DAY // 24 hours
+  }
+
+  return gap > threshold
+}
+
+function ActivityTab({
+  loading,
+  activities,
+  timezone,
+  dayStart,
+  onRefresh,
+  now,
+}: {
+  loading: boolean
+  activities: UndoEntry[]
+  timezone: string
+  dayStart: string
+  onRefresh: () => void
+  /** Timestamp captured when activities were fetched — used for time-ago separator labels. */
+  now: number
+}) {
+  const [batchDialogOpen, setBatchDialogOpen] = useState(false)
+  const [batchMode, setBatchMode] = useState<'undo' | 'redo'>('undo')
+  const [batchCount, setBatchCount] = useState(0)
+  const [batchThroughId, setBatchThroughId] = useState<number | null>(null)
+
+  // --- Cmd+Z / Cmd+Shift+Z keyboard shortcuts for single undo/redo ---
+  // Unscoped, unlike every other page: History is where you go to reach an
+  // action from before this page loaded (an earlier visit, another device), so
+  // Cmd+Z undoes the newest entry in the log whatever its age, matching the
+  // list below. Without a session scope the server's counts are the whole
+  // log's, so the toast leaves off the "· N left" suffix.
+  const { handleUndoRef, handleRedoRef } = useUndoRedo({ onRefresh, sessionScoped: false })
+
+  useUndoRedoShortcuts(handleUndoRef, handleRedoRef)
+
+  const handleUndoToHere = useCallback(
+    (entryId: number) => {
+      // Count non-undone entries from the top down to (and including) this entry
+      const count = activities.filter((a) => !a.undone && a.id >= entryId).length
+      if (count === 0) return
+      setBatchMode('undo')
+      setBatchCount(count)
+      setBatchThroughId(entryId)
+      setBatchDialogOpen(true)
+    },
+    [activities],
+  )
+
+  const handleRedoToHere = useCallback(
+    (entryId: number) => {
+      // Count undone entries from the bottom up to (and including) this entry
+      const count = activities.filter((a) => a.undone && a.id <= entryId).length
+      if (count === 0) return
+      setBatchMode('redo')
+      setBatchCount(count)
+      setBatchThroughId(entryId)
+      setBatchDialogOpen(true)
+    },
+    [activities],
+  )
+
+  const handleBatchConfirm = useCallback(async () => {
+    if (batchThroughId === null) return
+    setBatchDialogOpen(false)
+
+    const endpoint = batchMode === 'undo' ? '/api/undo/batch' : '/api/redo/batch'
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ through_id: batchThroughId }),
+      })
+      if (!res.ok) {
+        showToast({ message: `${batchMode === 'undo' ? 'Undo' : 'Redo'} failed`, type: 'error' })
+        return
+      }
+      const data = await res.json()
+      showToast({
+        message: `${batchMode === 'undo' ? 'Undid' : 'Redid'} ${data.data.count} actions`,
+        type: 'success',
+      })
+      onRefresh()
+    } catch {
+      showToast({ message: `${batchMode === 'undo' ? 'Undo' : 'Redo'} failed`, type: 'error' })
+    }
+  }, [batchMode, batchThroughId, onRefresh])
+
+  return (
+    <div>
+      {loading ? (
+        <div className="text-muted-foreground animate-pulse py-8 text-center">Loading...</div>
+      ) : activities.length === 0 ? (
+        <p className="text-muted-foreground py-8 text-center">No activity recorded.</p>
+      ) : (
+        <div>
+          {activities.map((a, i) => {
+            const showSep = i > 0 && shouldShowSeparator(activities[i - 1], a, now)
+            return (
+              <div key={a.id}>
+                {/* Time-ago pill: shows how long ago the entries below occurred */}
+                {showSep && (
+                  <div className="flex items-end gap-2 pt-1.5 pb-4">
+                    <div className="border-border/60 h-1.5 flex-1 rounded-bl-md border-b border-l" />
+                    <span className="text-muted-foreground/70 translate-y-[5px] text-[11px] leading-none">
+                      {formatTimeAgoLabel(activities[i - 1], now, timezone, dayStart)}
+                    </span>
+                    <div className="border-border/60 h-1.5 flex-1 rounded-br-md border-r border-b" />
+                  </div>
+                )}
+                <div className={i > 0 && !showSep ? 'mt-2' : ''}>
+                  <ExpandableActivityItem
+                    activity={a}
+                    timezone={timezone}
+                    onUndoToHere={!a.undone ? () => handleUndoToHere(a.id) : undefined}
+                    onRedoToHere={a.undone ? () => handleRedoToHere(a.id) : undefined}
+                  />
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      <BatchUndoDialog
+        open={batchDialogOpen}
+        onOpenChange={setBatchDialogOpen}
+        mode={batchMode}
+        count={batchCount}
+        onConfirm={handleBatchConfirm}
+        context="history"
+      />
+    </div>
+  )
+}
+
+/**
+ * " · Watch" after an entry's time: the client that made it (client
+ * attribution, 2026-10-20). Nothing for an unknown client or a row from
+ * before the client was recorded. The token's name, when there is one, is the
+ * hover title — not worth a place in the row.
+ */
+function ClientTag({ client, tokenName }: { client?: string | null; tokenName?: string | null }) {
+  const label = clientLabel(client)
+  if (!label) return null
+  return (
+    <span data-activity-client={client} title={tokenName ? `Token: ${tokenName}` : undefined}>
+      {' · '}
+      {label}
+    </span>
+  )
+}
+
+/**
+ * Expandable activity item with chevron to show/hide full details.
+ * Collapsed: shows truncated description with chevron
+ * Expanded: shows full description, field badges, and before/after values
+ * Includes "Undo to here" or "Redo to here" action button.
+ */
+function ExpandableActivityItem({
+  activity,
+  timezone,
+  onUndoToHere,
+  onRedoToHere,
+}: {
+  activity: UndoEntry
+  timezone: string
+  onUndoToHere?: () => void
+  onRedoToHere?: () => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const hasDetails = activity.snapshot.length > 0 || activity.fields_changed.length > 0
+
+  return (
+    <div
+      className={cn(
+        'border-border rounded-lg border',
+        activity.undone && 'border-l-4 border-l-amber-300 dark:border-l-amber-600',
+        hasDetails && 'hover:bg-accent/50',
+      )}
+    >
+      {/* Header - always visible, clickable if has details */}
+      <div className="flex items-center gap-1 pr-2">
+        <button
+          onClick={() => hasDetails && setExpanded(!expanded)}
+          className={cn(
+            'flex min-w-0 flex-1 items-center gap-3 p-3 text-left',
+            hasDetails && 'cursor-pointer',
+          )}
+          disabled={!hasDetails}
+          type="button"
+        >
+          {hasDetails ? (
+            expanded ? (
+              <ChevronDown className="text-muted-foreground size-4 flex-shrink-0" />
+            ) : (
+              <ChevronRight className="text-muted-foreground size-4 flex-shrink-0" />
+            )
+          ) : (
+            <span className="size-4 flex-shrink-0" />
+          )}
+
+          <div className="min-w-0 flex-1">
+            <p className={cn('text-sm font-medium', !expanded && 'truncate')}>
+              {formatActivityDescription(activity, timezone)}
+            </p>
+            <p className="text-muted-foreground text-xs">
+              {new Date(activity.created_at).toLocaleString('en-US', {
+                timeZone: timezone,
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true,
+              })}
+              <ClientTag client={activity.client} tokenName={activity.token_name} />
+              {activity.undone && ' (undone)'}
+            </p>
+          </div>
+        </button>
+
+        {/* Undo/Redo to here button */}
+        {onUndoToHere && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onUndoToHere}
+            className="text-muted-foreground hover:text-foreground flex-shrink-0 gap-1 text-xs"
+          >
+            <Undo2 className="size-3" />
+            Undo to here
+          </Button>
+        )}
+        {onRedoToHere && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onRedoToHere}
+            className="text-muted-foreground hover:text-foreground flex-shrink-0 gap-1 text-xs"
+          >
+            <Redo2 className="size-3" />
+            Redo to here
+          </Button>
+        )}
+      </div>
+
+      {/* Expanded details */}
+      {expanded && hasDetails && (
+        <div className="border-border bg-muted/50 border-t p-3">
+          <ActivityDetails activity={activity} timezone={timezone} />
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Shows detailed information about an activity entry:
+ * - Fields changed badges
+ * - Before/after values for each changed field
+ * - For bulk operations: task count and first few task titles
+ */
+function ActivityDetails({ activity, timezone }: { activity: UndoEntry; timezone: string }) {
+  const { snapshot, fields_changed } = activity
+  const isBulk = activity.action.startsWith('bulk_')
+
+  // Filter out internal fields that shouldn't be shown to users
+  const displayFields = fields_changed.filter(
+    (f) =>
+      ![
+        'anchor_time',
+        'anchor_dow',
+        'anchor_dom',
+        'updated_at',
+        'original_due_at',
+        'target_set_at',
+        'target_auto',
+        'occurrence_at',
+      ].includes(f),
+  )
+
+  return (
+    <div className="space-y-3 text-sm">
+      {/* Fields changed badges */}
+      {displayFields.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-muted-foreground text-xs">Changed:</span>
+          {displayFields.map((field) => (
+            <Badge key={field} variant="secondary" className="text-xs">
+              {formatFieldName(field)}
+            </Badge>
+          ))}
+        </div>
+      )}
+
+      {/* For bulk operations, show affected task titles */}
+      {isBulk && snapshot.length > 0 && (
+        <div className="text-muted-foreground text-xs">
+          <span className="font-medium">{snapshot.length} tasks:</span>{' '}
+          {snapshot
+            .slice(0, 5)
+            .map((s) => s.before_state?.title || s.after_state?.title || `#${s.task_id}`)
+            .join(', ')}
+          {snapshot.length > 5 && ` +${snapshot.length - 5} more`}
+        </div>
+      )}
+
+      {/* For single task, show before/after details */}
+      {!isBulk && snapshot.length === 1 && (
+        <div className="space-y-1.5">
+          {displayFields.map((field) => {
+            const detail = formatFieldDetail(snapshot[0], field, timezone)
+            if (!detail) return null
+            return (
+              <div key={field} className="flex gap-2 text-xs">
+                <span className="text-muted-foreground font-medium">{formatFieldName(field)}:</span>
+                <span className="text-muted-foreground/80">{detail}</span>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Format a field name for display (e.g., 'due_at' -> 'Due date')
+ */
+function formatFieldName(field: string): string {
+  // Extra fields not in FIELD_LABELS
+  const extras: Record<string, string> = {
+    done: 'Status',
+    done_at: 'Done at',
+    archived_at: 'Archived',
+    deleted_at: 'Deleted',
+    snooze_count: 'Defer count',
+  }
+  const label = FIELD_LABELS[field] || extras[field]
+  if (label) return label.charAt(0).toUpperCase() + label.slice(1)
+  return field.replace(/_/g, ' ')
+}
+
+/**
+ * Format a single field's before/after values for display
+ */
+function formatFieldDetail(snapshot: UndoSnapshot, field: string, timezone: string): string | null {
+  const { before_state, after_state } = snapshot
+
+  switch (field) {
+    case 'priority': {
+      const before = formatPriority(before_state.priority)
+      const after = formatPriority(after_state.priority)
+      return `${before} → ${after}`
+    }
+    case 'title': {
+      const before = before_state.title ?? '(none)'
+      const after = after_state.title ?? '(none)'
+      const truncBefore = before.length > 25 ? before.slice(0, 25) + '…' : before
+      const truncAfter = after.length > 25 ? after.slice(0, 25) + '…' : after
+      return `"${truncBefore}" → "${truncAfter}"`
+    }
+    case 'due_at': {
+      const before = before_state.due_at
+        ? formatTimeInTimezone(before_state.due_at, timezone)
+        : '(none)'
+      const after = after_state.due_at
+        ? formatTimeInTimezone(after_state.due_at, timezone)
+        : '(none)'
+      return `${before} → ${after}`
+    }
+    case 'done': {
+      const before = before_state.done ? 'Done' : 'Not done'
+      const after = after_state.done ? 'Done' : 'Not done'
+      return `${before} → ${after}`
+    }
+    case 'labels': {
+      const before = (before_state.labels || []).join(', ') || '(none)'
+      const after = (after_state.labels || []).join(', ') || '(none)'
+      return `${before} → ${after}`
+    }
+    case 'rrule': {
+      const before = before_state.rrule ? 'Has recurrence' : 'None'
+      const after = after_state.rrule ? 'Has recurrence' : 'None'
+      return `${before} → ${after}`
+    }
+    case 'snooze_count': {
+      // Retired 2026-10-12 (§6: no snooze state); still read for history
+      // written before then.
+      const before = (before_state as { snooze_count?: number }).snooze_count ?? 0
+      const after = (after_state as { snooze_count?: number }).snooze_count ?? 0
+      return `${before} → ${after}`
+    }
+    default:
+      return null
+  }
+}
+
+// --- AI Tab ---
+
+const ACTIVITY_PAGE_SIZE = 20
+
+function AITab({ timezone }: { timezone: string }) {
+  const { aiFeatureInfo } = useAiFeatureInfo()
+  const [data, setData] = useState<AIStatusData | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(false)
+  const [actionFilter, setActionFilter] = useState('')
+  const [hasMore, setHasMore] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+
+  // Ref tracks current data so fetchStatus can read it without depending on it.
+  // This avoids a stale closure: the effect should re-run when actionFilter changes
+  // (to refetch), but not when data changes (which would cause an infinite loop).
+  const dataRef = useRef(data)
+  dataRef.current = data
+
+  const fetchStatus = useCallback(
+    async (opts: { append?: boolean; offset?: number } = {}) => {
+      const { append = false, offset = 0 } = opts
+      if (!append) setLoading(true)
+      setError(false)
+      try {
+        const params = new URLSearchParams({
+          limit: String(ACTIVITY_PAGE_SIZE),
+          offset: String(offset),
+        })
+        if (actionFilter) params.set('action', actionFilter)
+
+        const res = await fetch(`/api/ai/status?${params}`)
+        if (!res.ok) {
+          setError(true)
+          return
+        }
+        const json = await res.json()
+        if (json.data) {
+          const current = dataRef.current
+          if (append && current) {
+            // Append new activity entries to existing data
+            setData({
+              ...json.data,
+              recent_activity: [...current.recent_activity, ...json.data.recent_activity],
+            })
+          } else {
+            setData(json.data)
+          }
+          setHasMore(json.data.recent_activity.length >= ACTIVITY_PAGE_SIZE)
+        }
+      } catch {
+        setError(true)
+      } finally {
+        setLoading(false)
+        setLoadingMore(false)
+      }
+    },
+    [actionFilter],
+  )
+
+  useEffect(() => {
+    fetchStatus()
+  }, [fetchStatus])
+
+  const handleLoadMore = useCallback(() => {
+    if (!data || loadingMore) return
+    setLoadingMore(true)
+    fetchStatus({ append: true, offset: data.recent_activity.length })
+  }, [data, loadingMore, fetchStatus])
+
+  const handleActionFilterChange = useCallback((action: string) => {
+    setActionFilter(action)
+  }, [])
+
+  const handleRefresh = useCallback(() => {
+    fetchStatus()
+  }, [fetchStatus])
+
+  if (loading) {
+    return <div className="text-muted-foreground animate-pulse py-8 text-center">Loading...</div>
+  }
+
+  if (error || !data) {
+    return (
+      <div className="py-8 text-center">
+        <p className="text-muted-foreground">
+          {error ? 'AI features are not available.' : 'No data.'}
+        </p>
+        <Button variant="ghost" size="sm" onClick={handleRefresh} className="mt-2">
+          Retry
+        </Button>
+      </div>
+    )
+  }
+
+  return (
+    <AIStatusContent
+      data={data}
+      timezone={timezone}
+      onRefresh={handleRefresh}
+      featureInfo={aiFeatureInfo}
+      showFilters
+      actionFilter={actionFilter}
+      onActionFilterChange={handleActionFilterChange}
+      hasMore={hasMore}
+      onLoadMore={handleLoadMore}
+      loadingMore={loadingMore}
+    />
+  )
+}

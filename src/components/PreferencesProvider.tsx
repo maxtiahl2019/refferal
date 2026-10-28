@@ -1,0 +1,849 @@
+'use client'
+
+import { useTimezone } from '@/hooks/useTimezone'
+import { setClientTargetContext } from '@/lib/task-segments'
+import { rememberQueueOn } from '@/lib/last-known-queue'
+import { createContext, useContext, useState, useEffect } from 'react'
+import { useSession } from 'next-auth/react'
+import type { LabelConfig, PriorityDisplayConfig } from '@/types'
+import { PROJECT_PREVIEW_DEFAULT, type GroupingMode } from '@/lib/grouping'
+import type { SortOption } from '@/lib/task-grouping'
+import type { AiMode } from '@/hooks/useAiMode'
+import type { FeatureMode } from '@/core/ai/user-context'
+import type { FeatureInfo } from '@/core/ai/models'
+import { WEEK_START_DEFAULT, type WeekStart } from '@/lib/week-start'
+import {
+  UNKNOWN_DAY_START,
+  browserDayStart,
+  rememberDayStart,
+  useLastKnownDayStart,
+} from '@/lib/browser-day-start'
+import { CHECK_IN_DAY_DEFAULT, type CheckInDay } from '@/lib/task-segments'
+import {
+  DEFAULT_PREFS,
+  DEFAULT_PRIORITY_DISPLAY,
+  createDirtyTracker,
+  createPreferenceSaver,
+  mergeLoadedPrefs,
+  parseServerPrefs,
+  type BulkSnoozeDefault,
+  type FeatureInfoMap,
+  type Prefs,
+} from '@/lib/preferences-state'
+import type { TimeSetting } from '@/lib/anchor-times'
+import { anchorPrefsOf, type AnchorPrefKey } from '@/lib/preferences-state'
+
+export type { FeatureMode, FeatureInfo, FeatureInfoMap, BulkSnoozeDefault }
+
+interface PreferencesContextValue {
+  aiAvailable: boolean
+  labelConfig: LabelConfig[]
+  setLabelConfig: (config: LabelConfig[]) => void
+  priorityDisplay: PriorityDisplayConfig
+  setPriorityDisplay: (config: PriorityDisplayConfig) => void
+  autoSnoozeDefault: number
+  setAutoSnoozeDefault: (minutes: number) => void
+  autoSnoozeUrgent: number
+  setAutoSnoozeUrgent: (minutes: number) => void
+  autoSnoozeHigh: number
+  /** §4.1 cadence ladder — P1 and P2 get their own intervals. */
+  autoSnoozeLow: number
+  autoSnoozeMedium: number
+  setAutoSnoozeHigh: (minutes: number) => void
+  setAutoSnoozeLow: (minutes: number) => void
+  setAutoSnoozeMedium: (minutes: number) => void
+  defaultSnoozeOption: string
+  setDefaultSnoozeOption: (option: string) => void
+  /** What a plain press of the bulk-snooze clock does — see `BulkSnoozeDefault`. */
+  bulkSnoozeDefault: BulkSnoozeDefault
+  setBulkSnoozeDefault: (value: BulkSnoozeDefault) => void
+  /** First day of the week (Settings) — the Quotas panel's week boundary. */
+  weekStart: WeekStart
+  setWeekStart: (value: WeekStart) => void
+  /** The horizon segments' weekday (Settings → "Check-in day", 2026-10-12). */
+  checkInDay: CheckInDay
+  setCheckInDay: (value: CheckInDay) => void
+  /** Show all's per-project cap before "Show all N" (Settings → Projects). */
+  projectPreviewCount: number
+  setProjectPreviewCount: (value: number) => void
+  /** Morning, Wake and Sleep, resolved by the server; see `useAnchorTimes`. */
+  morningTime: string
+  morningSlotId: number | null
+  wakeTime: string
+  wakeSlotId: number | null
+  sleepTime: string
+  sleepSlotId: number | null
+  padPresets: TimeSetting[]
+  /** "Day starts at": a setting, or null when unset (the 3:00 AM default). */
+  dayStart: TimeSetting | null
+  setAnchorPrefs: (values: Partial<Pick<Prefs, AnchorPrefKey>>) => void
+  /**
+   * Re-read the anchor times from the server (a reminder period changed, an
+   * undo, another tab). Only those seven fields; true when the read succeeded.
+   */
+  reloadPreferences: () => Promise<boolean>
+  defaultGrouping: GroupingMode
+  setDefaultGrouping: (grouping: GroupingMode) => void
+  /**
+   * True once the `/api/user/preferences` fetch below has settled (success
+   * or failure). Until then `defaultGrouping` (and everything else in this
+   * context) is the hardcoded fallback above, not the user's real value —
+   * see `useDefaultGrouping`'s doc comment for why a consumer that needs the
+   * REAL grouping (not just "a" grouping) has to wait on this.
+   */
+  preferencesLoaded: boolean
+  defaultSort: SortOption
+  defaultSortReversed: boolean
+  setSortPreference: (sort: SortOption, reversed: boolean) => void
+  /** §7.3 — dashboard filter-chip section pinned open by the user. */
+  filtersExpanded: boolean
+  setFiltersExpanded: (expanded: boolean) => void
+  notificationsEnabled: boolean
+  setNotificationsEnabled: (enabled: boolean) => void
+  enrichmentNotificationsEnabled: boolean
+  setEnrichmentNotificationsEnabled: (enabled: boolean) => void
+  sweepFeedbackNotificationsEnabled: boolean
+  setSweepFeedbackNotificationsEnabled: (enabled: boolean) => void
+  criticalAlertVolume: number
+  setCriticalAlertVolume: (volume: number) => void
+  aiContext: string | null
+  setAiContext: (context: string | null) => void
+  aiContextUpdatedAt: string | null
+  setAiContextUpdatedAt: (at: string | null) => void
+  aiMode: AiMode
+  setAiMode: (mode: AiMode) => void
+  aiShowScores: boolean
+  setAiShowScores: (show: boolean) => void
+  aiShowSignals: boolean
+  setAiShowSignals: (show: boolean) => void
+  aiEnrichmentMode: FeatureMode
+  setAiEnrichmentMode: (mode: FeatureMode) => void
+  aiQuickTakeMode: FeatureMode
+  setAiQuickTakeMode: (mode: FeatureMode) => void
+  aiWhatsNextMode: FeatureMode
+  setAiWhatsNextMode: (mode: FeatureMode) => void
+  aiInsightsMode: FeatureMode
+  setAiInsightsMode: (mode: FeatureMode) => void
+  aiProcessMode: FeatureMode
+  setAiProcessMode: (mode: FeatureMode) => void
+  aiWnCommentaryUnfiltered: boolean
+  setAiWnCommentaryUnfiltered: (show: boolean) => void
+  aiWnHighlight: boolean
+  setAiWnHighlight: (show: boolean) => void
+  aiInsightsSignalChips: boolean
+  setAiInsightsSignalChips: (show: boolean) => void
+  aiInsightsScoreChips: boolean
+  setAiInsightsScoreChips: (show: boolean) => void
+  aiSdkAvailable: boolean
+  aiApiAvailable: boolean
+  aiFeatureInfo: FeatureInfoMap | null
+  setAiFeatureInfo: (info: FeatureInfoMap) => void
+  /** The server's task-queue switch and the user's rollover time (`useTaskQueue`). */
+  taskQueue: boolean
+  rolloverTime: string | null
+  /** SHELVED (2026-10-22): the server's AI unshelve switch (`useAiUnshelved`). */
+  aiUnshelved: boolean
+}
+
+const PreferencesContext = createContext<PreferencesContextValue>({
+  aiAvailable: false,
+  labelConfig: [],
+  setLabelConfig: () => {},
+  priorityDisplay: DEFAULT_PRIORITY_DISPLAY,
+  setPriorityDisplay: () => {},
+  autoSnoozeDefault: 30,
+  setAutoSnoozeDefault: () => {},
+  autoSnoozeUrgent: 5,
+  setAutoSnoozeUrgent: () => {},
+  autoSnoozeHigh: 15,
+  autoSnoozeLow: 240,
+  autoSnoozeMedium: 60,
+  setAutoSnoozeHigh: () => {},
+  setAutoSnoozeLow: () => {},
+  setAutoSnoozeMedium: () => {},
+  defaultSnoozeOption: '60',
+  setDefaultSnoozeOption: () => {},
+  bulkSnoozeDefault: 'next_period',
+  setBulkSnoozeDefault: () => {},
+  weekStart: WEEK_START_DEFAULT,
+  setWeekStart: () => {},
+  checkInDay: CHECK_IN_DAY_DEFAULT,
+  setCheckInDay: () => {},
+  projectPreviewCount: PROJECT_PREVIEW_DEFAULT,
+  setProjectPreviewCount: () => {},
+  morningTime: '09:00',
+  morningSlotId: null,
+  wakeTime: '07:00',
+  wakeSlotId: null,
+  sleepTime: '22:00',
+  sleepSlotId: null,
+  padPresets: DEFAULT_PREFS.padPresets,
+  dayStart: null,
+  setAnchorPrefs: () => {},
+  reloadPreferences: async () => false,
+  defaultGrouping: 'project',
+  setDefaultGrouping: () => {},
+  preferencesLoaded: false,
+  defaultSort: 'horizon',
+  defaultSortReversed: false,
+  setSortPreference: () => {},
+  filtersExpanded: false,
+  setFiltersExpanded: () => {},
+  notificationsEnabled: true,
+  setNotificationsEnabled: () => {},
+  enrichmentNotificationsEnabled: true,
+  setEnrichmentNotificationsEnabled: () => {},
+  sweepFeedbackNotificationsEnabled: true,
+  setSweepFeedbackNotificationsEnabled: () => {},
+  criticalAlertVolume: 1.0,
+  setCriticalAlertVolume: () => {},
+  aiContext: null,
+  setAiContext: () => {},
+  aiContextUpdatedAt: null,
+  setAiContextUpdatedAt: () => {},
+  aiMode: 'on',
+  setAiMode: () => {},
+  aiShowScores: true,
+  setAiShowScores: () => {},
+  aiShowSignals: true,
+  setAiShowSignals: () => {},
+  aiEnrichmentMode: 'api',
+  setAiEnrichmentMode: () => {},
+  aiQuickTakeMode: 'api',
+  setAiQuickTakeMode: () => {},
+  aiWhatsNextMode: 'api',
+  setAiWhatsNextMode: () => {},
+  aiInsightsMode: 'api',
+  setAiInsightsMode: () => {},
+  aiProcessMode: 'api',
+  setAiProcessMode: () => {},
+  aiWnCommentaryUnfiltered: false,
+  setAiWnCommentaryUnfiltered: () => {},
+  aiWnHighlight: true,
+  setAiWnHighlight: () => {},
+  aiInsightsSignalChips: true,
+  setAiInsightsSignalChips: () => {},
+  aiInsightsScoreChips: true,
+  setAiInsightsScoreChips: () => {},
+  aiSdkAvailable: false,
+  aiApiAvailable: false,
+  aiFeatureInfo: null,
+  setAiFeatureInfo: () => {},
+  taskQueue: false,
+  rolloverTime: null,
+  aiUnshelved: false,
+})
+
+// Register the iOS APNs device token with the server using session cookie auth.
+// Called after preferences load and on late token arrival (CustomEvent).
+function registerDeviceToken() {
+  const info = (window as unknown as Record<string, unknown>).__OPENTASK_DEVICE_INFO as
+    | { token: string; bundleId: string; environment: string }
+    | undefined
+  if (!info?.token) return
+
+  fetch('/api/push/apns/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      device_token: info.token,
+      bundle_id: info.bundleId,
+      environment: info.environment,
+    }),
+  }).catch(() => {})
+}
+
+// Auto-provision a Bearer token for iOS notification actions (Done, Snooze).
+// The native app and notification extensions can't use session cookies, so they
+// need a Bearer token stored in the Keychain. This provisions one automatically
+// via session cookie auth, eliminating manual token setup.
+function provisionBearerToken() {
+  // Only run inside the iOS native wrapper (device info is injected by AppDelegate)
+  const info = (window as unknown as Record<string, unknown>).__OPENTASK_DEVICE_INFO as
+    | { token: string }
+    | undefined
+  if (!info?.token) return
+
+  const hasLocalToken = (window as unknown as Record<string, unknown>).__OPENTASK_HAS_TOKEN === true
+
+  // Last 8 chars of the keychain token (matches api_tokens.token_preview). Lets the
+  // server detect a token belonging to a *different* user — e.g. after an account switch
+  // in the webview — instead of assuming any local token is this user's. Older app builds
+  // don't inject it, so the field is omitted when unavailable.
+  const localTokenPreview = (window as unknown as Record<string, unknown>).__OPENTASK_TOKEN_PREVIEW
+
+  const payload: { has_local_token: boolean; local_token_preview?: string } = {
+    has_local_token: hasLocalToken,
+  }
+  if (typeof localTokenPreview === 'string' && localTokenPreview.length > 0) {
+    payload.local_token_preview = localTokenPreview
+  }
+
+  fetch('/api/tokens/provision', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+    .then((res) => (res.ok ? res.json() : null))
+    .then((data) => {
+      if (data?.data?.token) {
+        // New token provisioned — send to native via JS bridge
+        const w = window as unknown as {
+          webkit?: {
+            messageHandlers?: { opentask?: { postMessage: (msg: unknown) => void } }
+          }
+        }
+        w.webkit?.messageHandlers?.opentask?.postMessage({
+          action: 'provisionToken',
+          token: data.data.token,
+        })
+      }
+    })
+    .catch(() => {})
+}
+
+type FieldSet = <K extends keyof Prefs>(key: K, value: Prefs[K]) => void
+
+/** The context's plain setters: each changes one field (and marks it dirty) via `set`. */
+function makeFieldSetters(set: FieldSet) {
+  const field =
+    <K extends keyof Prefs>(key: K) =>
+    (value: Prefs[K]) =>
+      set(key, value)
+  return {
+    setField: set,
+    setLabelConfig: field('labelConfig'),
+    setPriorityDisplay: field('priorityDisplay'),
+    setAutoSnoozeDefault: field('autoSnoozeDefault'),
+    setAutoSnoozeUrgent: field('autoSnoozeUrgent'),
+    setAutoSnoozeHigh: field('autoSnoozeHigh'),
+    setAutoSnoozeLow: field('autoSnoozeLow'),
+    setAutoSnoozeMedium: field('autoSnoozeMedium'),
+    setDefaultSnoozeOption: field('defaultSnoozeOption'),
+    setBulkSnoozeDefault: field('bulkSnoozeDefault'),
+    setWeekStart: field('weekStart'),
+    setCheckInDay: field('checkInDay'),
+    setProjectPreviewCount: field('projectPreviewCount'),
+    setNotificationsEnabled: field('notificationsEnabled'),
+    setEnrichmentNotificationsEnabled: field('enrichmentNotificationsEnabled'),
+    setSweepFeedbackNotificationsEnabled: field('sweepFeedbackNotificationsEnabled'),
+    setCriticalAlertVolume: field('criticalAlertVolume'),
+    setAiContext: field('aiContext'),
+    setAiContextUpdatedAt: field('aiContextUpdatedAt'),
+    setAiMode: field('aiMode'),
+    setAiShowScores: field('aiShowScores'),
+    setAiShowSignals: field('aiShowSignals'),
+    setAiEnrichmentMode: field('aiEnrichmentMode'),
+    setAiQuickTakeMode: field('aiQuickTakeMode'),
+    setAiWhatsNextMode: field('aiWhatsNextMode'),
+    setAiInsightsMode: field('aiInsightsMode'),
+    setAiProcessMode: field('aiProcessMode'),
+    setAiWnCommentaryUnfiltered: field('aiWnCommentaryUnfiltered'),
+    setAiWnHighlight: field('aiWnHighlight'),
+    setAiInsightsSignalChips: field('aiInsightsSignalChips'),
+    setAiInsightsScoreChips: field('aiInsightsScoreChips'),
+    setAiFeatureInfo: field('aiFeatureInfo'),
+  }
+}
+
+/**
+ * The view preferences below (grouping, sort, filters fold, Track panel) are
+ * saved FIRE-AND-FORGET: state flips at once and the PATCH goes out behind
+ * it. Every one of those PATCHes is `keepalive: true`, because a plain fetch is
+ * cancelled when the page unloads — toggle a view and reload (or navigate)
+ * before the PATCH lands and the browser aborts it, the server may never apply
+ * it, and the page comes back showing the old choice. `keepalive` lets the
+ * request outlive the page; the bodies are a few bytes, far under its 64 KB cap.
+ *
+ * Two races around that, both handled in `@/lib/preferences-state` (see its
+ * module doc):
+ * - Every setter marks its field DIRTY. When the mount fetch lands it merges
+ *   with `mergeLoadedPrefs`, which leaves dirty fields alone, so a click made
+ *   before the load isn't undone by it. The dirty set is cleared once merged.
+ * - The PATCHes go through one `createPreferenceSaver`, so a field has at most
+ *   one save in flight and the newest click is sent after it, never raced
+ *   against it. A save still waiting behind another when the page is hidden
+ *   is sent right away on `pagehide` (keepalive carries it past the unload).
+ */
+export function PreferencesProvider({ children }: { children: React.ReactNode }) {
+  const { status } = useSession()
+  const [prefs, setPrefs] = useState<Prefs>(DEFAULT_PREFS)
+  const [preferencesLoaded, setPreferencesLoaded] = useState(false)
+  const timezone = useTimezone()
+  const [dirty] = useState(createDirtyTracker)
+  const [saver] = useState(() =>
+    createPreferenceSaver((body) =>
+      fetch('/api/user/preferences', {
+        method: 'PATCH',
+        keepalive: true,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }).then((res) => {
+        if (!res.ok) throw new Error(`PATCH /api/user/preferences ${res.status}`)
+      }),
+    ),
+  )
+
+  // Created once, so every plain setter keeps one identity for the provider's
+  // lifetime, as the useState setters they replace did (consumers list them
+  // in effect and callback deps).
+  const [setters] = useState(() =>
+    makeFieldSetters((key, value) => {
+      // Mark it so the mount load won't overwrite it (see the doc above).
+      dirty.mark(key)
+      setPrefs((prev) => ({ ...prev, [key]: value }))
+    }),
+  )
+  const { setField, ...plainSetters } = setters
+
+  useEffect(() => {
+    function onPageHide() {
+      saver.flushPending()
+    }
+    window.addEventListener('pagehide', onPageHide)
+    return () => window.removeEventListener('pagehide', onPageHide)
+  }, [saver])
+
+  // The mount load: one GET, merged over what the user changed meanwhile
+  // (the dirty fields).
+  const [loadPreferences] = useState(() => async (): Promise<void> => {
+    const res = await fetch('/api/user/preferences')
+    const data = res.ok ? await res.json() : null
+    const server = parseServerPrefs(data?.data)
+    // Take (and reset) the dirty set now: a change made after this point
+    // is applied by its own state update, which React queues after this merge.
+    const changed = dirty.take()
+    setPrefs((local) => mergeLoadedPrefs(local, changed, server))
+  })
+
+  useEffect(() => {
+    if (status !== 'authenticated') return
+    loadPreferences()
+      .then(() => {
+        // Register iOS device token and provision Bearer token using session cookie auth.
+        // This ensures push notifications follow the web-logged-in user,
+        // not the bearer token user from initial iOS setup.
+        registerDeviceToken()
+        provisionBearerToken()
+      })
+      .catch((err: unknown) => {
+        console.error('Failed to fetch preferences:', err)
+      })
+      .finally(() => {
+        setPreferencesLoaded(true)
+      })
+  }, [status, loadPreferences])
+
+  // ANCHOR TIMES ARE THE SERVER'S (2026-10-21): Morning, Wake, Sleep and the
+  // pad resolve against the reminder periods, so a period edit can move them
+  // without the user touching them. They are therefore never marked dirty —
+  // Settings writes them with the server's answer (or the same resolver,
+  // optimistically) — and a reload takes the server's values for those seven
+  // fields (and "Day starts at") only, leaving every other field and the dirty set alone. Reloaded
+  // after a period edit or undo in Settings (`TimeSlotSettings`), and when
+  // Settings opens or its window regains focus (`useFreshAnchorTimes`). Deliberately
+  // NOT on sync events: every page already holds its own stream, and a second
+  // stream plus a preferences GET after every task change in every tab costs
+  // latency for a value that only Settings edits. Other pages read the new
+  // anchor times on their next load, like every other preference.
+  const [anchorActions] = useState(() => ({
+    setAnchorPrefs: (values: Partial<Pick<Prefs, AnchorPrefKey>>) =>
+      setPrefs((prev) => ({ ...prev, ...values })),
+    reloadPreferences: async (): Promise<boolean> => {
+      try {
+        const res = await fetch('/api/user/preferences')
+        if (!res.ok) return false
+        const anchors = anchorPrefsOf(parseServerPrefs((await res.json())?.data))
+        setPrefs((prev) => ({ ...prev, ...anchors }))
+        return true
+      } catch (err: unknown) {
+        console.error('Failed to reload preferences:', err)
+        return false
+      }
+    },
+  }))
+
+  // Handle late APNs token arrival — iOS dispatches this CustomEvent when
+  // the device token arrives after the WebView has already loaded.
+  useEffect(() => {
+    if (status !== 'authenticated') return
+
+    function onDeviceToken() {
+      registerDeviceToken()
+      provisionBearerToken()
+    }
+
+    window.addEventListener('opentask-device-token', onDeviceToken)
+    return () => window.removeEventListener('opentask-device-token', onDeviceToken)
+  }, [status])
+
+  // The user's clock for a deadline's implied target (2026-10-10, ruling B2):
+  // set during render, before any child reads a task's target, so the first
+  // paint already agrees with the server. A plain module value, not state —
+  // nothing re-renders on it; the prefs that feed it already do.
+  setClientTargetContext({ timezone, morningTime: prefs.morningTime })
+
+  // The switch as last seen, for the next load's placeholders (`last-known-queue.ts`).
+  useEffect(() => {
+    if (preferencesLoaded) rememberQueueOn(prefs.taskQueue)
+  }, [preferencesLoaded, prefs.taskQueue])
+  // And the day boundary, so the next load's first paint already reads the
+  // user's day (`browser-day-start.ts`).
+  useEffect(() => {
+    if (!preferencesLoaded) return
+    const known = browserDayStart({
+      loaded: true,
+      taskQueue: prefs.taskQueue,
+      rolloverTime: prefs.rolloverTime,
+      remembered: null,
+    })
+    if (known) rememberDayStart(known)
+  }, [preferencesLoaded, prefs.taskQueue, prefs.rolloverTime])
+
+  return (
+    <PreferencesContext.Provider
+      value={{
+        ...prefs,
+        ...plainSetters,
+        ...anchorActions,
+        setDefaultGrouping: (grouping: GroupingMode) => {
+          setField('defaultGrouping', grouping)
+          saver.save('default_grouping', { default_grouping: grouping })
+        },
+        preferencesLoaded,
+        setSortPreference: (sort: SortOption, reversed: boolean) => {
+          setField('defaultSort', sort)
+          setField('defaultSortReversed', reversed)
+          saver.save('default_sort', { default_sort: sort, default_sort_reversed: reversed })
+        },
+        setFiltersExpanded: (expanded: boolean) => {
+          if (expanded === prefs.filtersExpanded) return
+          setField('filtersExpanded', expanded)
+          saver.save('filters_expanded', { filters_expanded: expanded })
+        },
+      }}
+    >
+      {children}
+    </PreferencesContext.Provider>
+  )
+}
+
+export function useLabelConfig() {
+  const { labelConfig, setLabelConfig } = useContext(PreferencesContext)
+  return { labelConfig, setLabelConfig }
+}
+
+export function usePriorityDisplay() {
+  const { priorityDisplay, setPriorityDisplay } = useContext(PreferencesContext)
+  return { priorityDisplay, setPriorityDisplay }
+}
+
+export function useAutoSnoozeDefault() {
+  const {
+    autoSnoozeDefault,
+    setAutoSnoozeDefault,
+    autoSnoozeUrgent,
+    setAutoSnoozeUrgent,
+    autoSnoozeHigh,
+    setAutoSnoozeHigh,
+    autoSnoozeLow,
+    setAutoSnoozeLow,
+    autoSnoozeMedium,
+    setAutoSnoozeMedium,
+  } = useContext(PreferencesContext)
+  return {
+    autoSnoozeDefault,
+    setAutoSnoozeDefault,
+    autoSnoozeUrgent,
+    setAutoSnoozeUrgent,
+    autoSnoozeHigh,
+    setAutoSnoozeHigh,
+    autoSnoozeLow,
+    setAutoSnoozeLow,
+    autoSnoozeMedium,
+    setAutoSnoozeMedium,
+  }
+}
+
+export function useSnoozePreferences() {
+  const {
+    defaultSnoozeOption,
+    setDefaultSnoozeOption,
+    bulkSnoozeDefault,
+    setBulkSnoozeDefault,
+    morningTime,
+  } = useContext(PreferencesContext)
+  return {
+    defaultSnoozeOption,
+    setDefaultSnoozeOption,
+    bulkSnoozeDefault,
+    setBulkSnoozeDefault,
+    morningTime,
+  }
+}
+
+/**
+ * The number pad's four preset buttons (anchor times, 2026-10-21), resolved
+ * by the server, in button order — two may read the same time.
+ */
+export function usePadPresets(): TimeSetting[] {
+  return useContext(PreferencesContext).padPresets
+}
+
+/**
+ * Settings' view of the seven anchor times: each as `{ time, slot_id }`
+ * (resolved), plus the writer Settings applies the server's answer with and
+ * the reload a reminder-period change calls.
+ */
+export function useAnchorTimes() {
+  const ctx = useContext(PreferencesContext)
+  return {
+    morning: { time: ctx.morningTime, slot_id: ctx.morningSlotId },
+    wake: { time: ctx.wakeTime, slot_id: ctx.wakeSlotId },
+    sleep: { time: ctx.sleepTime, slot_id: ctx.sleepSlotId },
+    pad: ctx.padPresets,
+    dayStart: ctx.dayStart,
+    setAnchorPrefs: ctx.setAnchorPrefs,
+    reloadPreferences: ctx.reloadPreferences,
+  }
+}
+
+/**
+ * The user's first day of the week and its setter. The setter only changes
+ * local state — Settings PATCHes `week_start` itself (the server then closes
+ * any week the new boundary ends; see the preferences route).
+ */
+export function useWeekStart() {
+  const { weekStart, setWeekStart } = useContext(PreferencesContext)
+  return { weekStart, setWeekStart }
+}
+
+/**
+ * The user's check-in day (2026-10-12, spec §3): the weekday the Weeks,
+ * Months and Eventually task segments come round on — the segment headers'
+ * hints say it ("Tuesdays"). Settings PATCHes `check_in_day` itself.
+ */
+export function useCheckInDay() {
+  const { checkInDay, setCheckInDay } = useContext(PreferencesContext)
+  return { checkInDay, setCheckInDay }
+}
+
+/**
+ * THE TASK QUEUE, as the browser sees it (task queue PR 3): `enabled` is the
+ * server's switch (`OPENTASK_TASK_QUEUE`, from GET /api/user/preferences) —
+ * it gates the queue UI: the queue panels themselves come from the server
+ * only when it is on, and the segment rows' On deck buttons, the horizon dot on
+ * their meta line and "Considered all" on the task panels show only with it.
+ * `attemptsRolloverTime` is what the attempts read (`effectiveAttempts`) and
+ * the 3× offer take: the user's rollover time with the switch on (OpenTask
+ * days, B7 — the server's own count, its early-morning-pick rule included),
+ * null with it off (calendar days, as before the queue).
+ *
+ * The rollover time is the one the page loaded with: a period added or moved
+ * in another tab is picked up on the next load.
+ *
+ * `loaded`: the preferences fetch has settled. Until then `enabled` is the
+ * fallback (false), not the server's answer, so a surface that would draw
+ * one thing with the switch on and another with it off draws NEITHER until
+ * it knows — nothing swaps over when the fetch lands (the attempts read uses
+ * the server's stored count meanwhile, `attemptsOf` below).
+ */
+export function useTaskQueue(): {
+  loaded: boolean
+  enabled: boolean
+  attemptsRolloverTime: string | null
+} {
+  const { taskQueue, rolloverTime, preferencesLoaded } = useContext(PreferencesContext)
+  return {
+    loaded: preferencesLoaded,
+    enabled: taskQueue,
+    attemptsRolloverTime: taskQueue ? rolloverTime : null,
+  }
+}
+
+/**
+ * THE BROWSER'S DAY BOUNDARY ("Day starts at" PR 2, Trent 2026-10-24:
+ * everything uses the OpenTask date): the user's day start with the task
+ * queue's switch on, else midnight — the server's `dayBoundaryForUser`, the
+ * one rule. Every client "today" goes through it, into the pure helpers of
+ * `src/lib/opentask-day.ts` (and the functions built on them —
+ * `getTimezoneDayBoundaries`, `targetIsToday`, `segmentState`,
+ * `upcomingState`, `isRelevantNow`, `deckIsToday`, the quota periods): the
+ * Now view, the Today pill and the header counts, the date labels, the
+ * filter chips, decks, the Quotas page, History, and the Reminders screen's
+ * "has this slot started". Until the preferences load, midnight. The guard
+ * (TQ-G03, tests/behavioral/tq-day-guard.test.ts) keeps `CALENDAR_DAY_START`
+ * out of every other client file, so no surface picks its own day.
+ */
+export function useDayStart(): string {
+  return useKnownDayStart() ?? UNKNOWN_DAY_START
+}
+
+/** The boundary, or null before the preferences load with nothing remembered. */
+function useKnownDayStart(): string | null {
+  const { taskQueue, rolloverTime, preferencesLoaded } = useContext(PreferencesContext)
+  const remembered = useLastKnownDayStart()
+  return browserDayStart({ loaded: preferencesLoaded, taskQueue, rolloverTime, remembered })
+}
+
+/**
+ * Whether `useDayStart` is the user's real boundary yet — the preferences
+ * have loaded, or this browser remembers it. Until then it is midnight, and
+ * an action that commits a DAY (Defer's "tomorrow", "next period still
+ * today") waits, as `useTaskQueue`'s `loaded` gates the queue UI: between
+ * midnight and the day start, midnight's "tomorrow" is a day late.
+ */
+export function useDayStartKnown(): boolean {
+  return useKnownDayStart() !== null
+}
+
+/**
+ * How many tasks each project group in All shows before "Show all". Like
+ * `useWeekStart`, the setter only changes local state — Settings PATCHes
+ * `project_preview_count` itself.
+ */
+export function useProjectPreviewCount() {
+  const { projectPreviewCount, setProjectPreviewCount } = useContext(PreferencesContext)
+  return { projectPreviewCount, setProjectPreviewCount }
+}
+
+/**
+ * `groupingLoaded` is `preferencesLoaded` under this hook's own name: until
+ * the `/api/user/preferences` fetch settles, `defaultGrouping` is the
+ * hardcoded `'project'` fallback in this file, not the user's real
+ * preference. Most consumers render fine either way — the fallback just
+ * flashes briefly. But `DashboardClient`'s `?task=<id>&highlight=1` effect
+ * groups tasks BY `defaultGrouping` to find and expand the linked row, and
+ * resolving that against the fallback (rather than waiting a beat for the
+ * real value) can expand the wrong group for anyone on another view — found
+ * by browser-verifying against a dev account whose real default (then the
+ * since-retired `'slot'`) differed from the fallback.
+ */
+export function useDefaultGrouping() {
+  const { defaultGrouping, setDefaultGrouping, preferencesLoaded } = useContext(PreferencesContext)
+  return { defaultGrouping, setDefaultGrouping, groupingLoaded: preferencesLoaded }
+}
+
+export function useDefaultSort() {
+  const { defaultSort, defaultSortReversed, setSortPreference } = useContext(PreferencesContext)
+  return { defaultSort, defaultSortReversed, setSortPreference }
+}
+
+/**
+ * §7.3 — whether the user has pinned the dashboard's filter-chip section open.
+ * Server-persisted like the other dashboard view preferences (grouping, sort),
+ * so the choice follows the user across devices. See `useFilterSection`, which
+ * layers the filter-driven auto-expand on top of this.
+ */
+export function useFilterSectionPreference() {
+  const { filtersExpanded, setFiltersExpanded } = useContext(PreferencesContext)
+  return { filtersExpanded, setFiltersExpanded }
+}
+
+export function useAiContext() {
+  const { aiContext, setAiContext, aiContextUpdatedAt, setAiContextUpdatedAt } =
+    useContext(PreferencesContext)
+  return { aiContext, setAiContext, aiContextUpdatedAt, setAiContextUpdatedAt }
+}
+
+export function useNotificationConfig() {
+  const {
+    notificationsEnabled,
+    setNotificationsEnabled,
+    enrichmentNotificationsEnabled,
+    setEnrichmentNotificationsEnabled,
+    sweepFeedbackNotificationsEnabled,
+    setSweepFeedbackNotificationsEnabled,
+    criticalAlertVolume,
+    setCriticalAlertVolume,
+  } = useContext(PreferencesContext)
+  return {
+    notificationsEnabled,
+    setNotificationsEnabled,
+    enrichmentNotificationsEnabled,
+    setEnrichmentNotificationsEnabled,
+    sweepFeedbackNotificationsEnabled,
+    setSweepFeedbackNotificationsEnabled,
+    criticalAlertVolume,
+    setCriticalAlertVolume,
+  }
+}
+
+export function useAiPreferences() {
+  const {
+    aiMode,
+    setAiMode,
+    aiShowScores,
+    setAiShowScores,
+    aiShowSignals,
+    setAiShowSignals,
+    aiEnrichmentMode,
+    setAiEnrichmentMode,
+    aiQuickTakeMode,
+    setAiQuickTakeMode,
+    aiWhatsNextMode,
+    setAiWhatsNextMode,
+    aiInsightsMode,
+    setAiInsightsMode,
+    aiProcessMode,
+    setAiProcessMode,
+    aiWnCommentaryUnfiltered,
+    setAiWnCommentaryUnfiltered,
+    aiWnHighlight,
+    setAiWnHighlight,
+    aiInsightsSignalChips,
+    setAiInsightsSignalChips,
+    aiInsightsScoreChips,
+    setAiInsightsScoreChips,
+    aiSdkAvailable,
+    aiApiAvailable,
+  } = useContext(PreferencesContext)
+  return {
+    aiMode,
+    setAiMode,
+    aiShowScores,
+    setAiShowScores,
+    aiShowSignals,
+    setAiShowSignals,
+    aiEnrichmentMode,
+    setAiEnrichmentMode,
+    aiQuickTakeMode,
+    setAiQuickTakeMode,
+    aiWhatsNextMode,
+    setAiWhatsNextMode,
+    aiInsightsMode,
+    setAiInsightsMode,
+    aiProcessMode,
+    setAiProcessMode,
+    aiWnCommentaryUnfiltered,
+    setAiWnCommentaryUnfiltered,
+    aiWnHighlight,
+    setAiWnHighlight,
+    aiInsightsSignalChips,
+    setAiInsightsSignalChips,
+    aiInsightsScoreChips,
+    setAiInsightsScoreChips,
+    aiSdkAvailable,
+    aiApiAvailable,
+  }
+}
+
+export function useAiAvailable() {
+  return useContext(PreferencesContext).aiAvailable
+}
+
+/**
+ * SHELVED (2026-10-22; src/core/ai/shelved.ts): true only when the server runs
+ * with `OPENTASK_AI_UNSHELVE=1`. False — the default, and false until the
+ * preferences load — hides every What's Next, Insights and Quick Take
+ * surface. Callers never write a preference because of it: a user's AI modes
+ * stay as they were for when the features come back.
+ */
+export function useAiUnshelved() {
+  return useContext(PreferencesContext).aiUnshelved
+}
+
+export function useAiFeatureInfo() {
+  const { aiFeatureInfo, setAiFeatureInfo } = useContext(PreferencesContext)
+  return { aiFeatureInfo, setAiFeatureInfo }
+}

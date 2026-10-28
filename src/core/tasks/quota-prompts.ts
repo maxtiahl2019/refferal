@@ -1,0 +1,240 @@
+/**
+ * Quota reminders (2026-09-24) — "prompts".
+ *
+ * Trent never opens the Quotas surface, so quotas go undone; reminders are
+ * what he sees and gets nagged about. So every UNMET quota also appears as a
+ * reminder-like PROMPT in a reminder period (time slot) each day, with its
+ * progress on it: "Water the herb garden · 3/5".
+ *
+ * Ticking a reminder means "considered" — seen and handled — not "did it". A
+ * prompt therefore has TWO actions (Trent's final decision, 2026-09-24):
+ *   - CONSIDER (the round circle, as on a reminder): handled for today, no
+ *     progress logged. Consider-all only ever considers.
+ *   - DID IT (the square checkbox by the count): progress, and considered too.
+ * Both live in `./quota-prompt-actions.ts`; this file only COMPUTES prompts.
+ *
+ * NOT REAL TASKS. Prompts are computed at read time from each quota's state
+ * plus its `quota_day_state` (the owner's day: progress logged, prompts
+ * considered, prompts done). Nothing is stored per prompt, so there is nothing
+ * to sync, duplicate or clean up. Each prompt is identified by its
+ * `prompt_key` (`q:<taskId>:<k>:<date>`, see `@/lib/quota-prompts`).
+ *
+ * THE RULES
+ * - Daily quota, target N: numbers 1..N spread over the day's periods,
+ *   starting at the quota's period and clamping at the last one (never
+ *   wrapping back to early morning); each number's period can be overridden.
+ *   At most ONE row per quota per period: the row stands for the highest
+ *   number assigned there (`k`), is done once today's count reaches k, and its
+ *   label shows progress ("Piano Scales · 1/2"), never "#1".
+ * - Every other quota (weekly, monthly, yearly, daily with INTERVAL > 1):
+ *   one prompt a day in its period. Done for today once ANY progress is
+ *   logged today from anywhere; gone until the period resets once met.
+ * - Yearly and period-less quotas default OFF; everything else ON, for every
+ *   user. `quota_prompt_config.enabled` overrides.
+ * - Only the user's OWN quotas. `getQuotas` includes shared-project rows owned
+ *   by others, and prompting Trent about Casey's quota would be wrong.
+ * - Off switches: the user's `quota_prompts_enabled`, and the server-wide
+ *   `OPENTASK_QUOTA_PROMPTS=off`. Either one makes every group's prompts empty.
+ *
+ * WHERE THEY GO: a NEW `groups[].prompts` field on GET /api/reminders.
+ * `groups[].reminders` stays reminder-only, which is what keeps native builds
+ * that predate prompts — they ignore unknown fields — safe. That is also why
+ * this is a sibling of `getRemindersBySlot` rather than part of it.
+ * The slot notifications and hourly nags count prompts too (phase 3, once the
+ * native checklist could show them): `waitingBySlot` in
+ * `src/core/notifications/slot-reminders.ts` reads this function, so both
+ * off switches silence prompts there as well. The app-icon badge never
+ * counts them.
+ *
+ * SLOT RESOLUTION: a prompt stores slot IDS (in its config, and the user's
+ * default in `users.quota_prompt_slot_id`) and resolves them here, at read
+ * time: the quota's own slot, else the user's default, else the first period
+ * of the day. Retiming a slot keeps its id, so its prompts follow it.
+ * DELETING a slot repoints every stored id that names it to the nearest
+ * remaining slot — where its reminders go — inside the delete's own
+ * transaction and undo entry (`deleteTimeSlot`, src/core/time-slots/edit.ts;
+ * Trent, 2026-09-25), so undoing the delete puts the prompts back too. The
+ * read-time fallback past a missing id is only a safety net now, for ids left
+ * stale by deletes made before that rule.
+ *
+ * A quota always has a period (QUOTA_PERIOD_MESSAGE, 2026-09-25): create and
+ * edit refuse a period-less one. The period-less branches below (default
+ * off, `period: null`) stay only so a legacy row reads harmlessly.
+ */
+
+import { getDb } from '@/core/db'
+import { listTimeSlots } from '@/core/time-slots'
+import { getLabelColor } from '@/lib/label-colors'
+import {
+  comparePrompts,
+  dayStateFor,
+  isDailyQuota,
+  promptDate,
+  promptEnabled,
+  promptKey,
+  promptPlacements,
+  resolvePromptSlot,
+  type QuotaPrompt,
+} from '@/lib/quota-prompts'
+import { effectiveProgress, isTracked, quotaLabelOf, quotaPeriodOf } from '@/lib/track'
+import { coerceWeekStart, type WeekStart } from '@/lib/week-start'
+import type { LabelColor, LabelConfig, Task } from '@/types'
+import { getTasks } from './create'
+import { dayBoundaryForUser } from './rollover-time'
+
+// The prompt's shape lives in the client-safe half, so the web surfaces and
+// the server agree on one definition.
+export {
+  assignDailyNumbers,
+  isDailyQuota,
+  promptEnabled,
+  promptWaiting,
+  resolvePromptSlot,
+  type QuotaPrompt,
+} from '@/lib/quota-prompts'
+
+/** The server-wide kill switch, read per call so it can be flipped without a code change. */
+export function quotaPromptsEnabledGlobally(): boolean {
+  return (process.env.OPENTASK_QUOTA_PROMPTS ?? '').trim().toLowerCase() !== 'off'
+}
+
+interface UserPromptSettings {
+  enabled: boolean
+  defaultSlotId: number | null
+  labelConfig: LabelConfig[]
+  /** Where a weekly quota's period ends — an expired week's count reads 0. */
+  weekStart: WeekStart
+}
+
+function readUserSettings(userId: number): UserPromptSettings {
+  const row = getDb()
+    .prepare(
+      'SELECT quota_prompts_enabled, quota_prompt_slot_id, label_config, week_start FROM users WHERE id = ?',
+    )
+    .get(userId) as
+    | {
+        quota_prompts_enabled: number
+        quota_prompt_slot_id: number | null
+        label_config: string
+        week_start: string
+      }
+    | undefined
+  let labelConfig: LabelConfig[] = []
+  try {
+    labelConfig = row?.label_config ? (JSON.parse(row.label_config) as LabelConfig[]) : []
+  } catch {
+    labelConfig = []
+  }
+  return {
+    enabled: (row?.quota_prompts_enabled ?? 1) !== 0,
+    defaultSlotId: row?.quota_prompt_slot_id ?? null,
+    labelConfig,
+    weekStart: coerceWeekStart(row?.week_start),
+  }
+}
+
+function stripeColor(task: Task, labelConfig: LabelConfig[]): LabelColor | null {
+  const label = quotaLabelOf(task)
+  const color = label ? getLabelColor(label, labelConfig) : null
+  return color === 'green' ? null : color
+}
+
+/** The window `rowToTask` served on the task, in the owner's clock, under the prompt's names. */
+function promptPeriodFields(
+  task: Task,
+): Pick<QuotaPrompt, 'period_interval' | 'period_end' | 'period_last_day' | 'period_label'> {
+  return {
+    period_interval: task.period_interval ?? null,
+    period_end: task.progress_period_end ?? null,
+    period_last_day: task.period_last_day ?? null,
+    period_label: task.period_label ?? null,
+  }
+}
+
+/**
+ * Today's prompts for a user, by slot id (`null` = the un-slotted group).
+ * Every prompt assigned today is returned, handled ones included with their
+ * `considered`/`done` flags — the slot bar sizes a period by its day total,
+ * which must not shrink as things are handled.
+ */
+export function getQuotaPromptsBySlot(
+  userId: number,
+  timezone: string,
+  now: Date = new Date(),
+): Map<number | null, QuotaPrompt[]> {
+  const bySlot = new Map<number | null, QuotaPrompt[]>()
+  if (!quotaPromptsEnabledGlobally()) return bySlot
+  const settings = readUserSettings(userId)
+  if (!settings.enabled) return bySlot
+
+  const slots = listTimeSlots(userId)
+  const dayStart = dayBoundaryForUser(userId)
+  const date = promptDate(timezone, dayStart, now)
+  const quotas = getTasks({ userId, done: false, kind: 'quota', limit: 1000 }).filter(
+    (t) => isTracked(t) && t.user_id === userId && promptEnabled(t),
+  )
+
+  const slotIdAt = (slotIndex: number) => (slotIndex < 0 ? null : slots[slotIndex].id)
+  const push = (slotIndex: number, prompt: Omit<QuotaPrompt, 'slot_id'>) => {
+    const slotId = slotIdAt(slotIndex)
+    bySlot.set(slotId, [...(bySlot.get(slotId) ?? []), { ...prompt, slot_id: slotId }])
+  }
+
+  for (const task of quotas) {
+    const current = effectiveProgress(task, timezone, now, settings.weekStart, dayStart)
+    const target = Math.max(1, task.progress_target ?? 1)
+    const day = dayStateFor(task.quota_day_state, date)
+    const base = {
+      task_id: task.id,
+      title: task.title,
+      current,
+      target,
+      period: quotaPeriodOf(task.rrule)?.freq ?? null,
+      ...promptPeriodFields(task),
+      stripe_color: stripeColor(task, settings.labelConfig),
+      has_notes: !!task.notes?.trim(),
+      priority: task.priority,
+    }
+
+    if (isDailyQuota(task)) {
+      // One row per period, standing for every number assigned there; it is
+      // keyed and judged by the highest of them (`promptPlacements`).
+      for (const row of promptPlacements(task, slots, settings.defaultSlotId)) {
+        const key = promptKey(task.id, row.number, date)
+        push(row.slotIndex, {
+          ...base,
+          prompt_key: key,
+          number: row.number,
+          numbers: row.numbers,
+          considered: day.considered.includes(key),
+          done: current >= row.number,
+        })
+      }
+      continue
+    }
+
+    const key = promptKey(task.id, 0, date)
+    const did = day.did.includes(key)
+    const considered = day.considered.includes(key)
+    const loggedToday = day.logged > 0
+    // Met before today and untouched today: gone until the period resets.
+    // Met TODAY (by a did-it or a +1) stays, handled, so today's count of
+    // handled prompts does not drop a row the user just finished.
+    if (current >= target && !loggedToday && !did && !considered) continue
+    push(resolvePromptSlot(slots, task.quota_prompt_config?.slot_id, settings.defaultSlotId), {
+      ...base,
+      prompt_key: key,
+      number: null,
+      numbers: null,
+      considered,
+      done: did || loggedToday,
+    })
+  }
+
+  // Priority first, Urgent to None, like the period's reminders (Trent,
+  // 2026-10-26), then title, then id. Frozen: no action on a prompt changes
+  // any of the three, so acting on one never reorders the rest under the
+  // finger. See `comparePrompts`.
+  for (const [slotId, prompts] of bySlot) bySlot.set(slotId, prompts.sort(comparePrompts))
+  return bySlot
+}

@@ -1,0 +1,240 @@
+import AppKit
+import Foundation
+
+/// The menu bar item's data and actions (Trent, 2026-09-28: "a menu bar icon
+/// that's persistently there … a little badge on it for things that are
+/// overdue … click it to see what items are overdue … check them off, snooze
+/// to next period, snooze 1 hour for each, or in bulk").
+///
+/// Tasks only — reminders and quotas have their own widgets. "Overdue" is
+/// `TaskLists.overdue`, the same rule as the Tasks widget's Overdue page.
+///
+/// Freshness: one `GET /api/tasks` (the widgets' call) when the panel opens,
+/// every `refreshInterval` while the app runs, on wake, after every action,
+/// and when the server's silent `dismiss` push says a task changed elsewhere
+/// (`MacAppDelegate`). The badge can therefore lag a change made elsewhere by
+/// up to `refreshInterval` if no push arrives — cheap enough to poll, and the
+/// panel always refetches as it opens.
+@MainActor
+final class MenuBarModel: ObservableObject {
+
+    static let shared = MenuBarModel()
+
+    /// How many overdue rows the panel lists before "and N more…".
+    static let maxRows = 8
+    /// How many "Next up" rows when nothing is overdue.
+    static let maxNextUp = 5
+    private static let refreshInterval: TimeInterval = 120
+
+    @Published private(set) var tasks: [TaskDTO] = []
+    @Published private(set) var slots: [TimeSlotDTO] = TimeSlotStore.cachedSlots
+    /// For each row's check-off square colour (the project's, as on the
+    /// Tasks widget).
+    @Published private(set) var projects: [Int: ProjectDTO] = [:]
+    @Published private(set) var hasLoaded = false
+    @Published private(set) var errorText: String?
+    /// Rows with an action in flight — drawn dimmed, buttons disabled.
+    @Published private(set) var busyIds: Set<Int> = []
+    @Published private(set) var isSweeping = false
+    /// One line of feedback under the bulk bar ("Deferred 12 · 2 Urgent left"),
+    /// cleared on the next action or refresh.
+    @Published private(set) var note: String?
+    @Published var draftTitle = ""
+    @Published private(set) var isAdding = false
+    /// Bumps once a minute so "overdue" follows the clock between fetches.
+    @Published private(set) var now = Date()
+
+    private var timer: Timer?
+    private var clock: Timer?
+
+    private init() {}
+
+    #if DEBUG
+    /// Render-only seam (docs/SCREENSHOTS.md, `ios/Tests/Renders/`): a model
+    /// holding a fixed snapshot, never started, so the screenshot renderer can
+    /// draw `MenuBarPanel` with the sample account's tasks at the frozen clock.
+    /// DEBUG-only and unused by the app, which only ever has `shared`.
+    static func snapshot(
+        tasks: [TaskDTO], projects: [ProjectDTO], slots: [TimeSlotDTO], now: Date
+    ) -> MenuBarModel {
+        let model = MenuBarModel()
+        model.tasks = tasks
+        model.projects = Dictionary(projects.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        model.slots = slots
+        model.now = now
+        model.hasLoaded = true
+        return model
+    }
+    #endif
+
+    // MARK: - Derived lists
+
+    var overdue: [TaskDTO] { TaskLists.overdue(tasks, now: now) }
+
+    /// With nothing overdue: the rest of today (the OpenTask day,
+    /// `DayStartStore`), soonest first.
+    var nextUp: [TaskDTO] {
+        let today = TaskLists.dueToday(tasks, now: now, day: DayStartStore.current)
+        return Array(today.filter { !$0.isOverdue(now: now) }.prefix(Self.maxNextUp))
+    }
+
+    /// The sweep's estimate — the bulk bar's "Defer 2 of 3" (one High per
+    /// press with the task queue on, as the app last cached it).
+    var sweepCount: Int {
+        TaskLists.overdueSweepEligibleCount(tasks, now: now, taskQueue: DayStartStore.cachedTaskQueue)
+    }
+
+    /// Where "next period" lands for an overdue task (base = now) — the bulk
+    /// bar's label. nil with no cached slots (the server still resolves it).
+    var nextPeriodStart: Date? {
+        TimeSlotStore.nextPeriodStart(slots: slots, after: now)
+    }
+
+    // MARK: - Lifecycle
+
+    /// Start polling. Called once, at launch.
+    func start() {
+        guard timer == nil else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: Self.refreshInterval, repeats: true) { _ in
+            Task { @MainActor in await MenuBarModel.shared.refresh() }
+        }
+        clock = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            Task { @MainActor in MenuBarModel.shared.now = Date() }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { _ in
+            Task { @MainActor in await MenuBarModel.shared.refresh() }
+        }
+        Task { await refresh() }
+    }
+
+    func refresh() async {
+        guard AppConfig.shared.isConfigured else { return }
+        do {
+            let fetched = try await APIClient.shared.fetchOpenTasks()
+            tasks = fetched
+            errorText = nil
+        } catch {
+            errorText = "Couldn't reach OpenTask"
+        }
+        now = Date()
+        hasLoaded = true
+        if let fetched = try? await APIClient.shared.fetchProjects() {
+            projects = Dictionary(fetched.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        }
+        if let fresh = try? await APIClient.shared.fetchTimeSlots() {
+            slots = fresh
+            TimeSlotStore.save(fresh)
+        }
+    }
+
+    // MARK: - Row actions
+
+    func complete(_ task: TaskDTO) {
+        act(on: task.id) {
+            try await APIClient.shared.completeTasks(ids: [task.id])
+            return nil
+        }
+    }
+
+    /// Per-task snooze, through the phone widget's shared plan
+    /// (`TaskSnoozePlan`): an explicit pick bypasses the P3/P4 sweep filter,
+    /// and "+1h" on an upcoming task counts from its own due time.
+    func snooze(_ task: TaskDTO, _ target: TaskSnoozeTarget) {
+        let requests = TaskSnoozePlan.requests(
+            target, tasks: [(id: task.id, dueAt: task.dueDate)], now: Date(), slots: slots
+        )
+        act(on: task.id) {
+            var capped = false
+            let moved = await TaskSnoozePlan.send(requests, onCappedAtDeadline: { _ in capped = true })
+            guard moved.contains(task.id) else { return "Couldn't defer \"\(task.title)\"" }
+            // Ruling A3: a quick snooze stops AT a deadline still ahead — say so.
+            guard capped, let deadline = task.deadlineDate else { return nil }
+            return "Deferred to deadline \(deadline.formatted(date: .omitted, time: .shortened))"
+        }
+    }
+
+    private func act(on id: Int, _ work: @escaping () async throws -> String?) {
+        busyIds.insert(id)
+        note = nil
+        Task {
+            do {
+                note = try await work()
+            } catch {
+                note = "That didn't go through — try again"
+            }
+            await refresh()
+            busyIds.remove(id)
+        }
+    }
+
+    // MARK: - Bulk
+
+    /// The server-side sweep (`POST /api/tasks/bulk/snooze-overdue`): the
+    /// same call as the phone's "All overdue" bar and the watch — P3 only once
+    /// nothing lower is left, P4 never. The note says what stayed behind.
+    func snoozeAll(_ target: TaskSnoozeTarget) {
+        isSweeping = true
+        note = nil
+        Task {
+            do {
+                let result = switch target {
+                // `notify: false`: the note shows the result, so the server's
+                // feedback push would repeat it (src/core/notifications/sweep-feedback.ts).
+                case .nextPeriod: try await APIClient.shared.snoozeOverdue(slot: "next", notify: false)
+                case .plusOneHour: try await APIClient.shared.snoozeOverdue(deltaMinutes: 60, notify: false)
+                }
+                note = Self.sweepSummary(result)
+                // The moved tasks' banners, and only theirs.
+                await dismissNotificationsAfterSweep(result)
+            } catch {
+                note = "Defer failed — try again"
+            }
+            await refresh()
+            isSweeping = false
+        }
+    }
+
+    static func sweepSummary(_ result: APIClient.BulkSnoozeResult) -> String {
+        // The server's own line when it sends one (the web toast's words,
+        // which say what went to the Tasks queue at the day start).
+        if let summary = result.summary { return summary }
+        var parts: [String] = []
+        let n = result.tasksAffected
+        parts.append(n == 0 ? "Nothing to defer" : "Deferred \(n) \(n == 1 ? "task" : "tasks")")
+        // What stayed behind, in the menu bar's short wording (`SweepLine`).
+        // "Included N High" is left out: the headline already counts them.
+        for line in result.summaryLines {
+            switch line {
+            case .queued(let n, let at):
+                parts.append(at.map { "\(n) to the queue at \(SweepLine.timeWords($0))" } ?? "\(n) to the queue")
+            case .includedHigh: break
+            case .highStillOverdue(let n): parts.append("\(n) High left")
+            case .urgentStillOverdue(let n): parts.append("\(n) Urgent left")
+            }
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    // MARK: - Quick add
+
+    /// The web's quick add: the title alone, AI fills in the rest server-side.
+    func addDraft() {
+        let title = draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, !isAdding else { return }
+        isAdding = true
+        note = nil
+        Task {
+            do {
+                try await APIClient.shared.createTask(title: title)
+                draftTitle = ""
+                note = "Added \"\(title)\""
+            } catch {
+                note = "Couldn't add the task — try again"
+            }
+            isAdding = false
+            await refresh()
+        }
+    }
+}

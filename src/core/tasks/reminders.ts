@@ -1,0 +1,216 @@
+/**
+ * Reminders surface queries (REDESIGN-V03 §6)
+ *
+ * Prompted thoughts — principles and considerations delivered by repetition
+ * ("Morning = Focus, Afternoon = Meetings, Evening = Rest"). Not actions.
+ * Completing one means "I considered it", and that IS its completion.
+ *
+ * These differ BEHAVIOURALLY from tasks, which is why they get a surface rather
+ * than a tag: no debt, no badge, bucket-locked, container-notified. Behaviour
+ * enforced by the surface beats behaviour promised by discipline.
+ *
+ * WHAT MAKES A REMINDER "CURRENT TODAY": exactly the §4.6 schedule derivation,
+ * not `due_at` freshness. A missed reminder therefore resets naturally at its
+ * next occurrence — there is no roll-forward job and no accumulated
+ * "overdue by N days" state, ever. That absence of debt is the whole point.
+ *
+ * WHICH DAY (2026-10-23, "one day boundary everywhere"): "today" here is the
+ * OpenTask day (`reminderDay`: `dayBoundaryForUser` — the user's "Day starts
+ * at" with the task queue's switch on, midnight with it off). With the day
+ * starting at 3:00, a reminder considered at 00:30 was considered on the day
+ * before, and the evening's unfinished ones are still waiting until 3:00 —
+ * the slot nag (`slot-nags.ts`) reads this same roster.
+ */
+
+import { getDb } from '@/core/db'
+import { todaysOccurrence } from '@/core/recurrence/occurrence'
+import { groupBySlot, listTimeSlots, type TimeSlot } from '@/core/time-slots'
+import { openTaskDaySpan, type OpenTaskDaySpan } from '@/lib/opentask-day'
+import type { Task } from '@/types'
+import { getTasks, getTaskById } from './create'
+import { dayBoundaryForUser } from './rollover-time'
+
+/** The day the Reminders screen counts as "today" for this user, at `now`. */
+export function reminderDay(userId: number, timezone: string, now: Date): OpenTaskDaySpan {
+  return openTaskDaySpan(now, timezone, dayBoundaryForUser(userId))
+}
+
+const within = (iso: string | null | undefined, day: OpenTaskDaySpan): boolean => {
+  if (!iso) return false
+  const t = new Date(iso).getTime()
+  return !Number.isNaN(t) && t >= day.start.getTime() && t < day.end.getTime()
+}
+
+export interface ReminderGroup {
+  slot: TimeSlot | null
+  /** Still waiting to be considered today, highest priority first. */
+  reminders: Task[]
+  /**
+   * Considered today in this slot. Feeds the per-slot and per-day progress —
+   * the one score this surface keeps, because it only ever counts what the
+   * user DID (L1: absence is never a signal; a bar that filled with misses
+   * would be reading intent from what he didn't do).
+   */
+  considered: number
+  /**
+   * The considered ones, most recent first, so a slip is at the top. The
+   * surface shows them behind the slot's counter with a way to put one back.
+   */
+  consideredItems: Task[]
+}
+
+/**
+ * Every reminder for a user that is scheduled for today and not yet done.
+ *
+ * "Only incomplete items" is deliberate (§6): a completed reminder drops out of
+ * its bucket rather than sitting there greyed out, because leaving it would
+ * bury the ones still worth considering.
+ */
+export function getTodaysReminders(
+  userId: number,
+  timezone: string,
+  now: Date = new Date(),
+): Task[] {
+  const all = getTasks({ userId, done: false, kind: 'reminder', limit: 1000 })
+  const day = reminderDay(userId, timezone, now)
+
+  return all.filter((task) => {
+    // Non-recurring reminders show whenever they're undone — they have no
+    // schedule to fall outside of.
+    if (!task.rrule) return true
+
+    // Already considered today: completing a recurring reminder advances its
+    // schedule but leaves it "scheduled today" by the rrule's lights, so
+    // without this check a checked-off reminder would sit in its slot all day.
+    // §6: completed ones drop out; the next occurrence resurrects it.
+    if (within(task.last_completed_at, day)) return false
+
+    // from_completion reminders have no derivable occurrence until they are
+    // completed (§4.6) — their due_at IS the schedule, so show them once it
+    // arrives (still no debt: nothing here renders overdue styling).
+    if (task.recurrence_mode === 'from_completion') {
+      if (!task.due_at) return false
+      const due = new Date(task.due_at).getTime()
+      return !Number.isNaN(due) && due < day.end.getTime()
+    }
+
+    return todaysOccurrence(task, timezone, day) !== null
+  })
+}
+
+/**
+ * Today's reminders grouped into their time slots.
+ *
+ * Within a slot, higher priority sorts first — §6's "priority is prominence".
+ * The canonical high-priority reminder (morning supplements: "you don't have
+ * to, but consistency matters") is important without being an interrupt of
+ * its own, so importance is expressed by position and weight. Since
+ * 2026-10-22 (Trent) priority also sets how often its slot's ONE nag repeats
+ * while it waits — the shortest rung among the waiting items
+ * (`slot-nags.ts`). Since 2026-10-26 a Medium+ reminder is pushed on its own,
+ * by name (`reminder-nags.ts`), and leaves its slot's push and nag; None and
+ * Low still never notify on their own.
+ */
+export function getRemindersBySlot(
+  userId: number,
+  timezone: string,
+  now: Date = new Date(),
+): ReminderGroup[] {
+  const reminders = getTodaysReminders(userId, timezone, now)
+  const slots = listTimeSlots(userId)
+  // A reminder that is waiting again (an undone completion leaves
+  // last_completed_at behind) is waiting, not considered — never both.
+  const waitingIds = new Set(reminders.map((t) => t.id))
+  const considered = getConsideredToday(userId, timezone, now).filter((t) => !waitingIds.has(t.id))
+  const consideredAt = (t: Task) => t.last_completed_at ?? t.done_at ?? ''
+  const consideredBySlot = new Map(
+    groupBySlot(considered, slots, timezone).map((g) => [
+      g.slot?.id ?? null,
+      [...g.items].sort((a, b) => consideredAt(b).localeCompare(consideredAt(a))),
+    ]),
+  )
+
+  return groupBySlot(reminders, slots, timezone).map((group) => {
+    const consideredItems = consideredBySlot.get(group.slot?.id ?? null) ?? []
+    return {
+      slot: group.slot,
+      // Priority first; then creation order, which never moves. The query's
+      // own order is by due_at, and for a reminder due_at is an artifact — a
+      // schedule edit recomputes it to the next occurrence, which sent an
+      // edited reminder to the bottom of its slot (Trent, 2026-09-05).
+      reminders: [...group.items].sort(
+        (a, b) => (b.priority ?? 0) - (a.priority ?? 0) || a.id - b.id,
+      ),
+      considered: consideredItems.length,
+      consideredItems,
+    }
+  })
+}
+
+/**
+ * Reminders the user considered today: a recurring one whose last completion
+ * fell in today's OpenTask day (`reminderDay`), or a one-off completed in it.
+ * Read straight from the table rather than through `getTasks`, which excludes
+ * done rows.
+ */
+export function getConsideredToday(
+  userId: number,
+  timezone: string,
+  now: Date = new Date(),
+): Task[] {
+  const day = reminderDay(userId, timezone, now)
+  // Stored as ISO-8601 UTC with milliseconds ('…T…:…:….sssZ'), so string
+  // comparison is time order; the end is exclusive (the next day's start).
+  const start = day.start.toISOString()
+  const end = day.end.toISOString()
+  const rows = getDb()
+    .prepare(
+      `SELECT id FROM tasks
+        WHERE user_id = ? AND is_reminder = 1 AND deleted_at IS NULL
+          AND ((last_completed_at >= ? AND last_completed_at < ?)
+            OR (done = 1 AND done_at >= ? AND done_at < ?))`,
+    )
+    .all(userId, start, end, start, end) as { id: number }[]
+  // Load through the ordinary row loader so labels etc. are parsed the same
+  // way as everywhere else; a day's considered set is a few dozen rows at most.
+  return rows.flatMap((r) => {
+    const task = getTaskById(r.id)
+    return task ? [task] : []
+  })
+}
+
+/**
+ * Reminders that exist but have no occurrence today, so the surface can still
+ * reach them. Today's list is derived from the schedule (§4.6), and a weekly
+ * or monthly thought is therefore invisible on its off days — Trent hit this
+ * with a Sun/Fri reminder on a Saturday (2026-09-05). Considered-today ones
+ * are today's, just behind the counter, so they are not "not today".
+ */
+export function getRemindersNotToday(
+  userId: number,
+  timezone: string,
+  now: Date = new Date(),
+): Task[] {
+  const all = getTasks({ userId, done: false, kind: 'reminder', limit: 1000 })
+  const today = new Set(getTodaysReminders(userId, timezone, now).map((t) => t.id))
+  const considered = new Set(getConsideredToday(userId, timezone, now).map((t) => t.id))
+  return all.filter((t) => !today.has(t.id) && !considered.has(t.id)).sort((a, b) => a.id - b.id)
+}
+
+/**
+ * Does this user have any reminders at all (done or not, excluding trash)?
+ *
+ * Only the empty state depends on it: someone who has never made a reminder needs
+ * the surface explained, while someone who has simply finished today's needs to be
+ * told they are done, not taught what reminders are. Kept separate from
+ * `getRemindersBySlot` because that query answers "today", and today being empty is
+ * exactly when this distinction matters.
+ */
+export function hasAnyReminders(userId: number): boolean {
+  const row = getDb()
+    .prepare(
+      'SELECT 1 AS found FROM tasks WHERE user_id = ? AND is_reminder = 1 AND deleted_at IS NULL LIMIT 1',
+    )
+    .get(userId) as { found: number } | undefined
+  return row !== undefined
+}

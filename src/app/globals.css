@@ -1,0 +1,531 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+  /* Pre-blended badge colors: equivalent of 80% opacity on --background, but fully opaque
+     so underlying icons don't show through. Adjust L/C values to change perceived opacity. */
+  --badge-destructive: oklch(0.662 0.196 27.325);
+  /* Over target (2026-10-11): a calm plum, deliberately not red — an arrived
+     target is not a failure (Trent). Distinct from the reminders' violet. */
+  --over-target: oklch(0.56 0.17 322);
+  /* A SOLID plum fill under white text (the age tab's 7d+ step, the count
+     pills). Light mode: the plum itself, white on it ≈5.1:1. Dark mode needs
+     its own: dark --over-target is lifted for plum-on-black text and strokes,
+     and white on it measured ≈2.9:1 (2026-10-12 QA). Same hue, darker. */
+  --over-target-badge: var(--over-target);
+  /* Task segments (2026-10-11, Trent picked): one teal per horizon, darkest
+     for the soonest. The segment titles (and, in dark mode, the titles'
+     colour). Since 2026-10-26 no bar fills in them: every bar, slot or
+     segment, fills in the reminders' purple (`ReminderSlotBar`).
+     The native apps use the same hex values, light and dark. Teal stays
+     clear of the reminders' indigo/violet, the plum of over target, the red
+     of a passed deadline, the priority colours and the green of done. */
+  --segment-days: #0f9d8f;
+  --segment-weeks: #2bb5a6;
+  --segment-months: #4fb8ab;
+  --segment-eventually: #8ccfc6;
+  /* Upcoming (2026-10-12, proposed): a BLUER teal, so its bar reads apart from
+     Days beside it in the strip — same family, a step toward cyan. */
+  --segment-upcoming: #1a8fb0;
+  /* The task queue's two panels (2026-10-19, provisional): a deeper, greyer
+     cyan-teal than the horizons — the same family (they are task rows), a
+     step apart so the first bars in the strip read as their own thing.
+     "Today's pulls" is the strong one, "Previous pulls" the muted. */
+  --segment-queue_today: #0d7f8c;
+  --segment-queue_previous: #5c9ba3;
+  /* The deadlines page (2026-10-22, provisional): first in the strip and the
+     only queue page that nags. Never amber or red: those are the deadline
+     chip's (safety net, passed). Its fill is `--deadlines-fill` and its
+     title `--deadlines` (below), and so is its finished state — see
+     `segmentDoneColor`. */
+  --segment-deadlines: var(--deadlines-fill);
+  /* Titles: one darker teal in light mode, so the small uppercase label
+     stays readable on the near-white card (the lighter fills read at ~1.3–2.5:1).
+     In dark mode each title is its fill. */
+  --segment-title-days: #0b7a6f;
+  --segment-title-weeks: #0b7a6f;
+  --segment-title-months: #0b7a6f;
+  --segment-title-eventually: #0b7a6f;
+  --segment-title-upcoming: #136f8a;
+  --segment-title-queue_today: #0a6670;
+  --segment-title-queue_previous: #0a6670;
+  --segment-title-deadlines: var(--deadlines);
+  /* A lit deck button (`DECK_LIT`, 2026-10-28, Trent's "T2"): the queue's
+     teal drained toward slate, quieter on the dashboard — its own token, so
+     the "Today's pulls" title keeps its teal. 6.8:1 on the card. */
+  --deck-lit: #465f63;
+  --badge-neutral: oklch(0.368 0 0);
+  /* Every-time mode (2026-10-22, editor PR 4c; Trent: "Teal's fine"): the
+     Quick panel's framed "EDITING EVERY TIME" banner and frame. A MODE, not a
+     state — so not blue (blue in the panel means an unsaved change) and not a
+     horizon segment's teal (those mean pace). Deep green-teal from the mock;
+     white on it ≈5.4:1. */
+  --every-time: #0f766e;
+  --every-time-foreground: #ffffff;
+  /* The deadlines page's OWN teal (2026-10-26, experiment for Trent: "change
+     the color on that one and see what that's like"; then "That teal is too
+     blue", so a greener one). Its title, its FINISHED bar in the Tasks
+     card's strip and the /reminders day bar and its finished hairline (while
+     filling, every bar is the reminders' purple, 2026-10-26), and its
+     finished "N of N ✓" —
+     where every other segment turns green when done, this one stays its
+     teal (`segmentDoneColor` / `segmentDoneTextColor` in TaskSegmentRow.tsx).
+     Two tokens, because text and graphics have different contrast floors:
+     - `--deadlines` is the TEXT colour (the segment title, the "N of N"
+       numbers, as `--segment-title-deadlines`): #008464, small text, so WCAG
+       AA 4.5:1 — ≈4.53:1 on the segment's ~#fbfbfb bg-muted/30 section,
+       ≈4.68:1 on the white card.
+     - `--deadlines-fill` is the GRAPHICS colour (the strip and day-bar
+       fill, the hairline, the ✓ glyphs, as `--segment-deadlines`): teal-600
+       #0d9488, ≈3.62:1 on the section, over the 3:1 non-text floor. */
+  --deadlines: #008464;
+  --deadlines-fill: #0d9488;
+  /* Reminders get their own hue rather than the neutral grey: §6 says a waiting
+     thought is never overdue, so it must not be red, but grey read as disabled
+     next to a live count (Trent, 2026-09-06). Violet is the surface's own
+     colour and carries no urgency. */
+  --badge-reminders: oklch(0.55 0.2 295);
+  --ai-glow: oklch(0.7 0.15 270);
+  --ai-glow-shadow: rgba(129, 140, 248, 0.3);
+  --ai-glow-shadow-strong: rgba(129, 140, 248, 0.55);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --radius: 0.5rem;
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.145 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.985 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+  --badge-destructive: oklch(0.55 0.22 27.325);
+  --over-target: oklch(0.7 0.15 322);
+  /* White on it ≈6.0:1; against the dark card ≈3.3:1, so the tab's edge holds. */
+  --over-target-badge: oklch(0.52 0.16 322);
+  --segment-days: #2bb5a6;
+  --segment-weeks: #4fc8bb;
+  --segment-months: #8fdcd2;
+  --segment-eventually: #c3ece6;
+  --segment-upcoming: #4cb8d9;
+  --segment-queue_today: #36b8c6;
+  --segment-queue_previous: #7fbcc4;
+  --segment-deadlines: var(--deadlines-fill);
+  --segment-title-days: var(--segment-days);
+  --segment-title-weeks: var(--segment-weeks);
+  --segment-title-months: var(--segment-months);
+  --segment-title-eventually: var(--segment-eventually);
+  --segment-title-upcoming: var(--segment-upcoming);
+  --segment-title-queue_today: var(--segment-queue_today);
+  --segment-title-queue_previous: var(--segment-queue_previous);
+  --segment-title-deadlines: var(--deadlines);
+  --deck-lit: #85adb2;
+  --badge-neutral: oklch(0.803 0 0);
+  /* The same deep teal: white on it ≈5.4:1, its frame ≈3.4:1 on the dark card. */
+  --every-time: #0f766e;
+  --every-time-foreground: #ffffff;
+  /* Dark: one colour for text and fill, teal-400 #2dd4bf — ≈10.6:1 on the
+     dark card, clear of both floors. */
+  --deadlines: #2dd4bf;
+  --deadlines-fill: var(--deadlines);
+  --badge-reminders: oklch(0.62 0.19 295);
+  --ai-glow: oklch(0.6 0.18 270);
+  --ai-glow-shadow: rgba(129, 140, 248, 0.4);
+  --ai-glow-shadow-strong: rgba(129, 140, 248, 0.65);
+  --border: oklch(0.269 0 0);
+  --input: oklch(0.269 0 0);
+  --ring: oklch(0.439 0 0);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+}
+
+@theme inline {
+  /*
+   * The Tasks page's two-column split (DashboardClient.tsx's `mainClass`) rides
+   * the `xl` breakpoint. Default Tailwind `xl` is 80rem/1280px, where the two
+   * equal columns come out narrower (469px each) than today's single column
+   * (640px) — Trent, 2026-09-17: raise it so the split only kicks in once
+   * there's real room. 90.625rem = 1450px.
+   */
+  --breakpoint-xl: 90.625rem;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-badge-destructive: var(--badge-destructive);
+  --color-over-target: var(--over-target);
+  --color-over-target-badge: var(--over-target-badge);
+  --color-segment-days: var(--segment-days);
+  --color-segment-weeks: var(--segment-weeks);
+  --color-segment-months: var(--segment-months);
+  --color-segment-eventually: var(--segment-eventually);
+  --color-segment-upcoming: var(--segment-upcoming);
+  --color-segment-queue_today: var(--segment-queue_today);
+  --color-segment-queue_previous: var(--segment-queue_previous);
+  --color-segment-deadlines: var(--segment-deadlines);
+  --color-badge-neutral: var(--badge-neutral);
+  --color-every-time: var(--every-time);
+  --color-every-time-foreground: var(--every-time-foreground);
+  --color-deadlines: var(--deadlines);
+  --color-deadlines-fill: var(--deadlines-fill);
+  --color-badge-reminders: var(--badge-reminders);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply bg-background;
+    /* Reserve the vertical scrollbar's width even when the page is short, so
+       content that grows past the viewport (opening a slot, expanding a
+       group) does not shove the whole centered layout sideways. */
+    scrollbar-gutter: stable;
+    /* No double-tap zoom (2026-10-26) — the viewport export in layout.tsx
+       shuts pinch where iOS allows it; this is the half Safari honours in a
+       browser tab too. Panning and every tap are untouched. */
+    touch-action: manipulation;
+  }
+  /* Every enabled button is pressable, so it gets the hand (2026-10-20: Today
+     and On deck on the task rows, the pager chevrons, Considered all and Show
+     more all showed the arrow — browsers give a <button> `cursor: default`,
+     and only the controls that spelled out `cursor-pointer` had one). In the
+     base layer, so a `cursor-*` utility on a button still wins, and a
+     disabled button keeps the arrow. */
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+  body {
+    @apply bg-background text-foreground;
+    /* A word longer than its line breaks instead of running out of its box
+       (2026-10-26). Titles and notes are the user's own text: a pasted URL or
+       file path is one unbreakable "word". THE CASE THAT BROKE TRENT'S PHONE:
+       on /reminders a task segment row (`TaskSegmentRow`) with an x.com link
+       in its title; at the iOS app's 119% text the row's four 52px controls
+       leave the title a 76px column on a 402px screen, and the link ran ~450px
+       past it to x=532 — the page's width, which let iOS zoom the whole app
+       out to 0.756 (see layout.tsx; tests/e2e/tq-segments-always.spec.ts runs
+       that row at 119%). Any row title can hold one, so the rule is here and
+       not on that row. `break-word`,
+       not `anywhere`: it breaks only a word that does not fit, and leaves
+       every box's min-content width (flex and grid sizing) as it was. Text set
+       `nowrap` (truncated labels) is unaffected. */
+    overflow-wrap: break-word;
+    font-family:
+      var(--font-inter),
+      system-ui,
+      -apple-system,
+      sans-serif;
+  }
+}
+
+/* Custom animations */
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.2s ease-out;
+}
+
+.animate-fade-in {
+  animation: fade-in 0.15s ease-out;
+}
+
+/* A considered reminder leaving its slot.
+   It holds its full height for the first half — long enough that the second
+   click of a double-click lands on the inert row it just struck through
+   rather than on whichever thought would otherwise have slid up into the gap
+   — and only then collapses. The row is removed from the list on this
+   animation's `animationend`, never on a timer, so the two can never disagree.
+   `--reminder-row-h` is measured on the element as the animation starts,
+   because a row's height is however long its thought is. */
+@keyframes reminder-leaving {
+  0% {
+    height: var(--reminder-row-h);
+    opacity: 1;
+  }
+  50% {
+    height: var(--reminder-row-h);
+    opacity: 0.45;
+  }
+  100% {
+    height: 0;
+    margin-top: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    border-top-width: 0;
+    border-bottom-width: 0;
+    opacity: 0;
+  }
+}
+
+.animate-reminder-leaving {
+  animation: reminder-leaving 180ms ease-out forwards;
+  overflow: hidden;
+}
+
+/* Reduced motion still needs the event — the row is removed by `animationend`,
+   so it must fire. A zero-duration animation does fire it, and the dev check
+   confirms it end to end. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-reminder-leaving {
+    animation-duration: 0s;
+  }
+}
+
+/* A deep-linked row (?reminder=<id> on /reminders, ?task=<id>&highlight=1 on
+   /, ?quota=<id> on /quotas — all iOS/macOS widget links): a short flash
+   that says "this one", then nothing. It runs once on the element it lands
+   on and is never cleared in state, so a re-render cannot make it flash
+   again.
+
+   The ring is INSET, not outset like a normal focus ring: TaskRow's row sits
+   inside SwipeableRow, which clips outset shadows to its own overflow (see
+   TaskRow's isKeyboardFocused comment, the same clipping this sidesteps the
+   same way) — inset paints inside the row's own box, so it can never be cut
+   off by an ancestor regardless of that ancestor's overflow state. */
+@keyframes row-highlight {
+  0%,
+  55% {
+    background-color: var(--accent);
+    box-shadow: inset 0 0 0 2px var(--ring);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: inset 0 0 0 2px transparent;
+  }
+}
+
+.animate-row-highlight {
+  animation: row-highlight 2s ease-out;
+}
+
+/* Hide scrollbar for horizontal scroll areas */
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* AI enrichment processing indicator — subtle border pulse */
+@keyframes ai-processing {
+  0%,
+  100% {
+    border-color: var(--border);
+  }
+  50% {
+    border-color: var(--ai-glow);
+  }
+}
+
+.animate-ai-processing {
+  animation: ai-processing 2s ease-in-out infinite;
+}
+
+/* A quota met during the session (TrackPanel's `useMetPutAway`): it holds,
+   then fades over the last two seconds of MET_LEAVE_MS (5s), and is put away
+   when its timer ends. Keep the duration in step with MET_LEAVE_MS. */
+@keyframes met-leave {
+  0%,
+  60% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.15;
+  }
+}
+
+.animate-met-leave {
+  animation: met-leave 5s ease-in forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-met-leave {
+    animation: none;
+  }
+}
+
+/* "AI is filling in details…" in the Just added card — a slow gradient
+   sweep across the text, indigo to violet. Static under reduced motion. */
+@keyframes ai-shimmer {
+  0% {
+    background-position: -200px 0;
+  }
+  100% {
+    background-position: 200px 0;
+  }
+}
+
+.animate-ai-shimmer {
+  background: linear-gradient(90deg, #6366f1 0%, #a855f7 50%, #6366f1 100%);
+  background-size: 200px 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: ai-shimmer 2.4s linear infinite;
+}
+
+.animate-ai-shimmer svg {
+  color: #7c3aed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-ai-shimmer {
+    animation: none;
+  }
+}
+
+/* Quick Take typing indicator — iMessage-style bouncing dots */
+@keyframes typing-dot-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+
+.typing-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: currentColor;
+  animation: typing-dot-bounce 1.4s ease-in-out infinite;
+}
+
+/* Countdown ring drain for QuickTakeBanner auto-dismiss timer.
+   Radius 10 → circumference = 2π·10 ≈ 62.832. Must match RING_RADIUS in QuickTakeBanner.tsx. */
+@keyframes countdown-drain {
+  to {
+    stroke-dashoffset: 62.832;
+  }
+}
+
+/* Glow effect on AI button during insights generation */
+@keyframes ai-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 6px var(--ai-glow-shadow);
+  }
+  50% {
+    box-shadow: 0 0 14px var(--ai-glow-shadow-strong);
+  }
+}
+
+/* Indeterminate progress bar shimmer for single-call AI insights */
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+
+/* Safe area insets for mobile — env() returns the correct value per context:
+   0 in Safari (toolbar handles it), actual inset in standalone PWA/WKWebView.
+   No minimum needed. */
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.safe-top {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+/* Where a scroll-to-section lands: just under the sticky top bar. The bar is
+   `safe-top` (it grows by the top inset in the iOS app's WKWebView, which uses
+   `viewport-fit=cover`) plus its ~61px row; 4.5rem leaves a small gap below
+   it. Used by the dashboard's jumps (`useJumpToTaskList`): the overdue/today
+   jump on the first task group, and the "Jump to tasks" chevron on the list
+   wrapper (so the list's toolbar row lands here). `JumpToTasksFab` reads this
+   margin back as its landing line. */
+.scroll-below-header {
+  scroll-margin-top: calc(env(safe-area-inset-top, 0px) + 4.5rem);
+}

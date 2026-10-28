@@ -1,0 +1,1001 @@
+/**
+ * The dashboard's Reminders panel (above Track, right column at `xl`).
+ *
+ * Conventions borrowed from `dashboard-layout.spec.ts` (viewport handling,
+ * quota creation/cleanup so `twoColumn` actually splits) and
+ * `reminders.spec.ts` (seeding reminders via `page.request.post`, the
+ * `todayAt` helper). This spec owns neither surface — it only covers the
+ * compact panel itself: default slot, paging, the row cap, and completion.
+ * The cap rule it pins: 20 rows wide, 5 narrow, the rest behind "Show more".
+ */
+import { test, expect } from './fixtures'
+import type { Page } from '@playwright/test'
+import { DateTime } from 'luxon'
+
+/**
+ * The seeded test user's timezone — slot assignment is done in local time.
+ * Must track `globalSetup.ts`'s `E2E_TZ` override (default America/Chicago):
+ * this constant and the seeded user's actual DB timezone have to agree, or
+ * "now" here and "now" as the app computes it diverge. Overriding both lets a
+ * specific point in the local day (just after midnight, just after the last
+ * slot) be reproduced without waiting for real Chicago time to reach it.
+ */
+const TEST_TZ = process.env.E2E_TZ || 'America/Chicago'
+
+/** Today at HH:MM in the user's timezone, as a UTC ISO string. */
+function todayAt(hour: number, minute = 0): string {
+  return DateTime.now()
+    .setZone(TEST_TZ)
+    .set({ hour, minute, second: 0, millisecond: 0 })
+    .toUTC()
+    .toISO() as string
+}
+
+async function createReminder(page: Page, body: Record<string, unknown>): Promise<number> {
+  const res = await page.request.post('/api/tasks', { data: { is_reminder: true, ...body } })
+  expect(res.ok()).toBeTruthy()
+  const json = await res.json()
+  return json.data.id as number
+}
+
+async function createQuota(page: Page, body: Record<string, unknown>): Promise<number> {
+  const res = await page.request.post('/api/tasks', { data: body })
+  expect(res.ok()).toBeTruthy()
+  return (await res.json()).data.id as number
+}
+
+async function deleteTasks(page: Page, ids: number[]): Promise<void> {
+  for (const id of ids) await page.request.delete(`/api/tasks/${id}`)
+}
+
+interface TimeSlotDTO {
+  id: number
+  label: string
+  start_time: string
+}
+
+async function fetchTimeSlots(page: Page): Promise<TimeSlotDTO[]> {
+  const res = await page.request.get('/api/time-slots')
+  expect(res.ok()).toBeTruthy()
+  const json = await res.json()
+  // Earliest first, same order `groups` puts them in (see groupBySlot).
+  return (json.data.time_slots as TimeSlotDTO[])
+    .slice()
+    .sort((a, b) => a.start_time.localeCompare(b.start_time))
+}
+
+function parseHHMM(value: string): number {
+  const [h, m] = value.split(':').map(Number)
+  return h * 60 + m
+}
+
+/**
+ * Mirrors `naturalSlotIndex` in `src/lib/time-slot-assign.ts`: the latest slot
+ * whose start is at or before now, else the first slot. Duplicated here
+ * (rather than imported) because Playwright specs run outside the app's `@/`
+ * path aliasing — see the other spec files, none of which import app source.
+ */
+function naturalSlotIndex(slots: TimeSlotDTO[]): number {
+  const now = DateTime.now().setZone(TEST_TZ)
+  const minutes = now.hour * 60 + now.minute
+  let best = -1
+  let bestStart = -1
+  slots.forEach((s, i) => {
+    const start = parseHHMM(s.start_time)
+    if (start > minutes) return
+    if (start > bestStart) {
+      bestStart = start
+      best = i
+    }
+  })
+  return best >= 0 ? best : 0
+}
+
+function panel(page: Page) {
+  return page.locator('[data-reminders-panel]')
+}
+
+/** `formatClockTime` in the app: "07:00" → "7:00 AM". */
+function formatSlotTime(startTime: string): string {
+  return DateTime.fromFormat(startTime, 'HH:mm').toFormat('h:mm a')
+}
+
+test.describe('Dashboard Reminders panel — wide', () => {
+  test.use({ viewport: { width: 1600, height: 900 } })
+
+  test('sits above Track in the right column and shows the natural slot by default', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const naturalIndex = naturalSlotIndex(slots)
+    const natural = slots[naturalIndex]
+    // One minute after the slot's own boundary — safely inside its window
+    // without landing on a boundary shared with the slot before it.
+    const naturalStart = parseHHMM(natural.start_time) + 1
+
+    const ids: number[] = []
+    try {
+      // A quota, so `twoColumn` actually splits into two columns (see
+      // dashboard-layout.spec.ts) — without one the right column collapses
+      // and this test would trivially "pass" with no second column at all.
+      ids.push(
+        await createQuota(page, {
+          title: 'Reminders panel probe quota',
+          progress_target: 2,
+          rrule: 'FREQ=WEEKLY',
+          create_label: true,
+        }),
+      )
+      ids.push(
+        await createReminder(page, {
+          title: 'Reminders panel probe — natural slot',
+          due_at: todayAt(Math.floor(naturalStart / 60), naturalStart % 60),
+        }),
+      )
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+      await expect(page.locator('[data-track-panel]')).toBeVisible()
+
+      // Above Track, in the SAME (right) column: same left edge, sitting
+      // higher on the page, and to the right of the task list.
+      const panelBox = await panel(page).boundingBox()
+      const trackBox = await page.locator('[data-track-panel]').boundingBox()
+      const filtersBox = await page.locator('main > div').first().boundingBox()
+      if (!panelBox || !trackBox || !filtersBox) throw new Error('geometry not available')
+      expect(Math.round(panelBox.x)).toBe(Math.round(trackBox.x))
+      expect(panelBox.y).toBeLessThan(trackBox.y)
+      expect(panelBox.x).toBeGreaterThanOrEqual(filtersBox.x + filtersBox.width)
+
+      // The natural slot — the latest one at or before now — is what shows,
+      // named the same way as the widget's own pager.
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', String(natural.id))
+      // The label is rendered in small caps via CSS (`uppercase`); its DOM text
+      // content is the slot's own label, e.g. "Early morning".
+      await expect(panel(page).getByText(natural.label, { exact: true })).toBeVisible()
+      await expect(
+        panel(page).getByText(formatSlotTime(natural.start_time), { exact: false }),
+      ).toBeVisible()
+      await expect(panel(page).getByText('Reminders panel probe — natural slot')).toBeVisible()
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('a reminder with notes wears the Reminders page’s notes mark', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const natural = slots[naturalSlotIndex(slots)]
+    const start = parseHHMM(natural.start_time) + 1
+    const due = todayAt(Math.floor(start / 60), start % 60)
+    const ids: number[] = []
+    try {
+      ids.push(
+        await createReminder(page, { title: 'Panel noted thought', notes: 'Why', due_at: due }),
+      )
+      ids.push(await createReminder(page, { title: 'Panel bare thought', due_at: due }))
+      await page.goto('/')
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', String(natural.id))
+      const row = (title: string) => panel(page).locator('li[data-reminder-id]', { hasText: title })
+      await expect(row('Panel noted thought').getByLabel('Has notes')).toBeVisible()
+      await expect(row('Panel bare thought')).toBeVisible()
+      await expect(row('Panel bare thought').locator('[data-has-notes]')).toHaveCount(0)
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('pages between slots and disables the chevrons at both ends, without wrapping', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const naturalIndex = naturalSlotIndex(slots)
+
+    const ids: number[] = []
+    try {
+      // One reminder anywhere keeps the panel from hiding itself (it hides
+      // with nothing to show at all — see `hasAnything`).
+      ids.push(await createReminder(page, { title: 'Keeps the panel alive', due_at: todayAt(7) }))
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+
+      const prev = panel(page).getByRole('button', { name: 'Previous time slot' })
+      const next = panel(page).getByRole('button', { name: 'Next time slot' })
+
+      // Walk to the first slot and confirm the ends: no wraparound past it.
+      for (let i = 0; i < naturalIndex; i++) await prev.click()
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', String(slots[0].id))
+      await expect(prev).toBeDisabled()
+      await expect(next).toBeEnabled()
+
+      // Walk all the way to the LAST group — the trailing "Anytime" bucket,
+      // one past the real slots (`groups` always has `slots.length + 1`
+      // entries; see `groupBySlot`) — and confirm the other end.
+      for (let i = 0; i < slots.length; i++) await next.click()
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', 'unslotted')
+      await expect(next).toBeDisabled()
+      await expect(prev).toBeEnabled()
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('caps a long slot at 20 rows, and "Show more" uncaps it with a considered readout', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const naturalIndex = naturalSlotIndex(slots)
+    const natural = slots[naturalIndex]
+    const startMinutes = parseHHMM(natural.start_time)
+    const at = (offset: number) =>
+      todayAt(Math.floor((startMinutes + offset) / 60), (startMinutes + offset) % 60)
+
+    // 26 — past the wide cap of 20, so 6 are held back at this viewport.
+    // Completing one below still leaves 25, i.e. still capped.
+    const titles = Array.from({ length: 26 }, (_, i) => `Cap probe reminder ${i}`)
+    const ids: number[] = []
+    try {
+      for (let i = 0; i < titles.length; i++) {
+        ids.push(await createReminder(page, { title: titles[i], due_at: at(i + 1) }))
+      }
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', String(natural.id))
+
+      // Capped: 20 of the 26 on screen, a "Show more" beneath them, and the
+      // readout counting the whole slot (0 considered of 26).
+      await expect(panel(page).locator('li[data-reminder-id]:visible')).toHaveCount(20)
+      await expect(panel(page).getByText('of 26')).toBeVisible()
+      const showMore = panel(page).getByRole('button', { name: /Show more/ })
+      await expect(showMore).toBeVisible()
+      await expect(showMore).toContainText('6 more')
+      // No "Considered all" while capped. (Progress is no longer gated on
+      // expansion: the slot bar above carries it for the whole day and is
+      // always on screen — see ReminderSlotBar.)
+      const considerAll = panel(page).getByRole('button', {
+        name: /^Mark all in .+ as considered$/,
+      })
+      await expect(considerAll).toHaveCount(0)
+
+      await showMore.click()
+
+      // Uncapped: all 26 and the quick action.
+      await expect(panel(page).locator('li[data-reminder-id]:visible')).toHaveCount(26)
+      await expect(panel(page).getByRole('button', { name: /Show less/ })).toBeVisible()
+      await expect(considerAll).toBeVisible()
+
+      // A tap on a row's circle completes it and it leaves the panel; the
+      // slot's total holds steady while the considered half of the count climbs.
+      // Waited for explicitly (not just the optimistic UI update) so cleanup's
+      // DELETE below can never race the completion's own POST server-side.
+      const completion = page.waitForResponse((res) =>
+        res.url().includes(`/api/tasks/${ids[0]}/done`),
+      )
+      await panel(page)
+        .getByRole('button', { name: `Mark "${titles[0]}" as considered` })
+        .click()
+      await completion
+      await expect(panel(page).getByText(titles[0])).toHaveCount(0)
+      await expect(panel(page).locator('li[data-reminder-id]:visible')).toHaveCount(25)
+      await expect(panel(page).getByText('of 26')).toBeVisible()
+
+      // The toast's Undo proves the dashboard's OWN undo pipeline is wired to
+      // this panel end to end (`handleUndo` → `refreshAll` →
+      // `remindersRefreshRef.current?.()`) — a second, independent undo
+      // pipeline here would be a real bug (see DashboardClient.tsx), and this
+      // is the one thing that could not be seen from the row disappearing.
+      await page.locator('[data-sonner-toast]').getByRole('button', { name: 'Undo' }).click()
+      await expect(panel(page).locator('li[data-reminder-id]:visible')).toHaveCount(26)
+      await expect(panel(page).getByText(titles[0])).toBeVisible()
+
+      // Show less returns to the 20-row cap (of the 26 again waiting).
+      await panel(page).getByRole('button', { name: 'Show less' }).click()
+      await expect(panel(page).locator('li[data-reminder-id]:visible')).toHaveCount(20)
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('a long reminder wraps in full and is never truncated', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const natural = slots[naturalSlotIndex(slots)]
+    const naturalStart = parseHHMM(natural.start_time) + 1
+    // Long enough that one line cannot hold it at any sane panel width.
+    const title =
+      'Wrapping probe — a deliberately long thought that will not fit on a single line of the dashboard panel no matter how wide the column happens to be today'
+
+    const ids: number[] = []
+    try {
+      ids.push(
+        await createReminder(page, {
+          title,
+          due_at: todayAt(Math.floor(naturalStart / 60), naturalStart % 60),
+        }),
+      )
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+
+      const row = panel(page).locator(`li[data-reminder-id="${ids[0]}"]`)
+      await expect(row).toBeVisible()
+
+      // Trent, 2026-09-21: "reminders can't be truncated. They have to show
+      // the full thing... It needs to line wrap somehow."
+      const text = row.locator('p')
+      const metrics = await text.evaluate((el) => ({
+        clamp: getComputedStyle(el).webkitLineClamp,
+        overflow: getComputedStyle(el).textOverflow,
+        // Wrapped, not clipped: the rendered box is taller than one line and
+        // holds everything it was given.
+        scrollH: el.scrollHeight,
+        clientH: el.clientHeight,
+        lineHeight: parseFloat(getComputedStyle(el).lineHeight),
+      }))
+      expect(metrics.clamp === 'none' || metrics.clamp === '').toBe(true)
+      expect(metrics.overflow).not.toBe('ellipsis')
+      // Nothing is hidden past the box...
+      expect(metrics.scrollH).toBeLessThanOrEqual(metrics.clientH + 1)
+      // ...and it genuinely took more than one line to say it.
+      expect(metrics.clientH).toBeGreaterThan(metrics.lineHeight * 1.5)
+      await expect(text).toHaveText(title)
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('a slot inside the wide cap shows every row, with no toggle to press', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const natural = slots[naturalSlotIndex(slots)]
+    const startMinutes = parseHHMM(natural.start_time)
+    const at = (offset: number) =>
+      todayAt(Math.floor((startMinutes + offset) / 60), (startMinutes + offset) % 60)
+
+    // 7 — under the wide cap of 20, so nothing is held back HERE. The phone
+    // spec below seeds the same size and proves it IS capped at that width;
+    // the pair is what pins the cap as per-width rather than absolute.
+    const titles = Array.from({ length: 7 }, (_, i) => `Wide cap probe ${i}`)
+    const ids: number[] = []
+    try {
+      for (let i = 0; i < titles.length; i++) {
+        ids.push(await createReminder(page, { title: titles[i], due_at: at(i + 1) }))
+      }
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+
+      await expect(panel(page).locator('li[data-reminder-id]:visible')).toHaveCount(7)
+      await expect(panel(page).getByRole('button', { name: /Show more/ })).toBeHidden()
+      await expect(panel(page).getByRole('button', { name: /Show less/ })).toHaveCount(0)
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+})
+
+/**
+ * Press-and-hold on a row: a separate describe from the cap/paging suite
+ * above so this file's per-describe line count stays under ESLint's
+ * `max-lines-per-function` rather than growing that one further.
+ */
+test.describe('Dashboard Reminders panel — press and hold', () => {
+  test.use({ viewport: { width: 1600, height: 900 } })
+
+  /**
+   * Press-and-hold opens the row's read-only bubble, and the bubble's Open
+   * reaches the same editor `/reminders` uses (Trent,
+   * 2026-09-21: "whenever I do things with tasks it opens a modal... that's
+   * how I like to work"), for that ONE reminder. The circle is "complete this
+   * reminder" on a plain tap, so this pins the thing that must NOT happen: a
+   * hold that starts anywhere on the row — including, implicitly, near the
+   * circle — must never also fire the completion it takes to open the modal.
+   */
+  test('press-and-hold opens the row\u2019s bubble, whose Open reaches the editor', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const naturalIndex = naturalSlotIndex(slots)
+    const natural = slots[naturalIndex]
+    const naturalStart = parseHHMM(natural.start_time) + 1
+    const title = 'Reminders panel hold-to-edit probe'
+    // A note, because reading one from the dashboard is the whole reason the
+    // bubble exists — a panel row is one clamped line with no note indicator.
+    const notes = 'Only reachable from the bubble, not from the row.'
+
+    const ids: number[] = []
+    try {
+      ids.push(
+        await createReminder(page, {
+          title,
+          notes,
+          due_at: todayAt(Math.floor(naturalStart / 60), naturalStart % 60),
+        }),
+      )
+      const id = ids[0]
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+      await expect(panel(page).getByText(title)).toBeVisible()
+      // The note is NOT on the row itself.
+      await expect(panel(page).getByText(notes)).toHaveCount(0)
+
+      let doneRequests = 0
+      page.on('request', (r) => {
+        if (r.method() === 'POST' && r.url().endsWith(`/api/tasks/${id}/done`)) doneRequests++
+      })
+
+      // The title text, not the row's centre: the circle sits to its left,
+      // and a click there would be testing the wrong control.
+      await panel(page).getByText(title).click({ delay: 500 })
+
+      // A hold opens the READ-ONLY bubble, not the editor — and the note is
+      // legible there without opening anything further.
+      const bubble = page.locator(`[data-reminder-popover="${id}"]`)
+      await expect(bubble).toBeVisible()
+      await expect(bubble.getByText(notes)).toBeVisible()
+      await expect(page.locator(`[data-reminder-detail="${id}"]`)).toHaveCount(0)
+      expect(doneRequests).toBe(0)
+
+      // Open is the second step, and only it reaches the editor.
+      await bubble.getByRole('button', { name: 'Open' }).click()
+      const editor = page
+        .getByRole('dialog')
+        .filter({ has: page.locator('[data-reminder-detail]') })
+      await expect(editor).toBeVisible()
+      await expect(page.locator(`[data-reminder-detail="${id}"]`)).toBeVisible()
+      expect(doneRequests).toBe(0)
+
+      await page.keyboard.press('Escape')
+      await expect(page.getByRole('dialog')).toHaveCount(0)
+
+      // Still there, still waiting — the hold neither completed it nor left
+      // it in some half-edited state.
+      await expect(panel(page).getByText(title)).toBeVisible()
+      expect(doneRequests).toBe(0)
+      const after = await (await page.request.get(`/api/tasks/${id}`)).json()
+      expect(after.data.done).toBe(false)
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('deletes a reminder from its row’s editor, with an Undo', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const naturalIndex = naturalSlotIndex(slots)
+    const natural = slots[naturalIndex]
+    const naturalStart = parseHHMM(natural.start_time) + 1
+    const title = 'Reminders panel hold-to-delete probe'
+
+    const ids: number[] = []
+    try {
+      ids.push(
+        await createReminder(page, {
+          title,
+          due_at: todayAt(Math.floor(naturalStart / 60), naturalStart % 60),
+        }),
+      )
+      const id = ids[0]
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+      await panel(page).getByText(title).click({ delay: 500 })
+      await page
+        .locator(`[data-reminder-popover="${id}"]`)
+        .getByRole('button', { name: 'Open' })
+        .click()
+
+      const editor = page
+        .getByRole('dialog')
+        .filter({ has: page.locator('[data-reminder-detail]') })
+      await expect(editor).toBeVisible()
+      await expect(page.locator(`[data-reminder-detail="${id}"]`)).toBeVisible()
+
+      const deleted = page.waitForResponse(
+        (r) => r.url().includes('/api/tasks/bulk/delete') && r.request().method() === 'POST',
+      )
+      await editor.getByRole('button', { name: 'Move to Trash' }).click()
+      expect((await deleted).status()).toBe(200)
+      await expect(page.getByRole('dialog')).toHaveCount(0)
+      await expect(panel(page).getByText(title)).toHaveCount(0)
+
+      // The same Undo every soft delete offers.
+      await page.locator('[data-sonner-toast]').getByRole('button', { name: 'Undo' }).click()
+      await expect(panel(page).getByText(title)).toBeVisible()
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('tapping the slot header bar toggles the slot open and shut', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const natural = slots[naturalSlotIndex(slots)]
+    const startMinutes = parseHHMM(natural.start_time)
+    const at = (offset: number) =>
+      todayAt(Math.floor((startMinutes + offset) / 60), (startMinutes + offset) % 60)
+
+    // Past the wide cap, so there is something to reveal.
+    const titles = Array.from({ length: 23 }, (_, i) => `Header toggle probe ${i}`)
+    const ids: number[] = []
+    try {
+      for (let i = 0; i < titles.length; i++) {
+        ids.push(await createReminder(page, { title: titles[i], due_at: at(i + 1) }))
+      }
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+      await expect(panel(page).locator('li[data-reminder-id]:visible')).toHaveCount(20)
+
+      // Tapping the bar between the chevrons opens the slot (Trent,
+      // 2026-09-21) — the same thing "Show more" does, without hunting for it.
+      const header = panel(page).locator('[data-slot-header-toggle]')
+      await expect(header).toHaveAttribute('aria-expanded', 'false')
+      await header.click()
+      await expect(header).toHaveAttribute('aria-expanded', 'true')
+      await expect(panel(page).locator('li[data-reminder-id]:visible')).toHaveCount(23)
+
+      // ...and shuts it again.
+      await header.click()
+      await expect(header).toHaveAttribute('aria-expanded', 'false')
+      await expect(panel(page).locator('li[data-reminder-id]:visible')).toHaveCount(20)
+
+      // The chevrons keep their own job: paging, not toggling. "Next" rather
+      // than "Previous": `natural` is an index into `slots` (real slots
+      // only), and `groups` always has one more entry than that — the
+      // trailing "Anytime" bucket (see `groupBySlot`) — so Next is always
+      // enabled from the natural slot. Previous is not: before the first
+      // slot has started, `naturalSlotIndex` falls back to slot 0 (see its
+      // own docs), where Previous is disabled and a click on it would just
+      // sit waiting for an element that never becomes clickable.
+      await panel(page).getByRole('button', { name: 'Next time slot' }).click()
+      await expect(panel(page)).not.toHaveAttribute('data-reminders-slot', String(natural.id))
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('deletes a reminder straight from its bubble, with an Undo', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const natural = slots[naturalSlotIndex(slots)]
+    const naturalStart = parseHHMM(natural.start_time) + 1
+    const title = 'Bubble trash probe'
+
+    const ids: number[] = []
+    try {
+      ids.push(
+        await createReminder(page, {
+          title,
+          due_at: todayAt(Math.floor(naturalStart / 60), naturalStart % 60),
+        }),
+      )
+      const id = ids[0]
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+      await panel(page).getByText(title).click({ delay: 500 })
+
+      // The trash can sits beside Open, and asks nothing first — Trent,
+      // 2026-09-21: tasks have no confirmation either, and the Undo toast is
+      // "good enough or probably better because it reduces friction".
+      const bubble = page.locator(`[data-reminder-popover="${id}"]`)
+      await expect(bubble).toBeVisible()
+      const deleted = page.waitForResponse(
+        (r) => r.url().includes('/api/tasks/bulk/delete') && r.request().method() === 'POST',
+      )
+      await bubble.getByRole('button', { name: `Move "${title}" to Trash` }).click()
+      expect((await deleted).status()).toBe(200)
+
+      // Gone, and the bubble went with it rather than pointing at nothing.
+      await expect(panel(page).getByText(title)).toHaveCount(0)
+      await expect(page.locator(`[data-reminder-popover="${id}"]`)).toHaveCount(0)
+
+      // And it comes back.
+      await page.locator('[data-sonner-toast]').getByRole('button', { name: 'Undo' }).click()
+      await expect(panel(page).getByText(title)).toBeVisible()
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('the slot bar marks done, behind and not-yet slots, and jumps between them', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const naturalIndex = naturalSlotIndex(slots)
+    const natural = slots[naturalIndex]
+    const startMinutes = parseHHMM(natural.start_time)
+    const at = (offset: number) =>
+      todayAt(Math.floor((startMinutes + offset) / 60), (startMinutes + offset) % 60)
+
+    // A slot holding nothing gets no segment at all as of 2026-09-21, so the
+    // bar needs a SECOND populated slot to exist — seeding only the current
+    // one leaves a single segment, which is deliberately not drawn.
+    //
+    // Prefer a LATER slot, because only a slot whose time has not come can
+    // prove the "not yet = no colour" rule. But after the last slot's start
+    // time there is no later one, and reaching for it regardless is what made
+    // this test pass all day and fail every evening. Fall back to the nearest
+    // EARLIER slot so the bar always has its second segment; the not-yet
+    // assertion is the only part that needs the companion to be in the future.
+    const later = slots.find((sl) => parseHHMM(sl.start_time) > startMinutes)
+    const earlier = [...slots].reverse().find((sl) => parseHHMM(sl.start_time) < startMinutes)
+    const companion = later ?? earlier
+    expect(companion, 'the seed must provide at least two time slots').toBeDefined()
+    const companionStart = parseHHMM(companion!.start_time) + 1
+
+    const ids: number[] = []
+    try {
+      ids.push(await createReminder(page, { title: 'Slot bar probe A', due_at: at(1) }))
+      ids.push(await createReminder(page, { title: 'Slot bar probe B', due_at: at(2) }))
+      ids.push(
+        await createReminder(page, {
+          title: 'Slot bar probe companion',
+          due_at: todayAt(Math.floor(companionStart / 60), companionStart % 60),
+        }),
+      )
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+
+      const bar = page.getByRole('group', { name: "Today's reminder slots" })
+      await expect(bar).toBeVisible()
+
+      // Nothing empty is drawn: every segment on screen reports a real count.
+      for (const seg of await bar.getByRole('button').all()) {
+        expect(await seg.getAttribute('aria-label')).not.toContain('nothing today')
+      }
+      // One segment per slot group, and the one on screen is marked.
+      const segments = bar.getByRole('button')
+      expect(await segments.count()).toBeGreaterThanOrEqual(2)
+      const currentSeg = bar.locator(`[data-slot-segment="${natural.id}"]`)
+      await expect(currentSeg).toHaveAttribute('aria-current', 'true')
+      // The natural slot has two waiting, so it reads 'behind' once its own
+      // time has come — but `naturalSlotIndex` falls back to the FIRST slot
+      // when nothing has started yet (see its own docs), and before that
+      // slot's start time it genuinely has NOT started, which the bar must
+      // read as 'upcoming' (Trent's rule: nothing wears colour before its
+      // time). Mirrors `slotHasStarted` (reminders-summary.ts).
+      const localNow = DateTime.now().setZone(TEST_TZ)
+      const naturalStarted = parseHHMM(natural.start_time) <= localNow.hour * 60 + localNow.minute
+      await expect(currentSeg).toHaveAttribute(
+        'data-slot-state',
+        naturalStarted ? 'behind' : 'upcoming',
+      )
+
+      // A slot whose time has not come wears no colour — Trent's rule. When
+      // the run is late enough that the companion had to be an earlier slot,
+      // it has started and holds something undone, so it reads 'behind'.
+      await expect(bar.locator(`[data-slot-segment="${companion!.id}"]`)).toHaveAttribute(
+        'data-slot-state',
+        later ? 'upcoming' : 'behind',
+      )
+
+      // Width tracks how much a slot holds, not an equal share (Trent,
+      // 2026-09-21: "My slots are naturally even but that's not necessarily
+      // the case"). Both probes went into the natural slot, so it holds more
+      // than a slot seeded with nothing and must be at least as wide.
+      const currentBox = await currentSeg.boundingBox()
+      const emptyish = bar.locator(`[data-slot-segment="${companion!.id}"]`)
+      if (currentBox) {
+        const otherBox = await emptyish.boundingBox()
+        if (otherBox) expect(currentBox.width).toBeGreaterThanOrEqual(otherBox.width - 1)
+        // ...and nothing collapses below a thumb.
+        if (otherBox) expect(otherBox.width).toBeGreaterThanOrEqual(24)
+      }
+
+      // A segment is a way to get there.
+      const firstSeg = segments.first()
+      const targetSlot = await firstSeg.getAttribute('data-slot-segment')
+      await firstSeg.click()
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', String(targetSlot))
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('finishing a past slot moves on to the next unfinished one; paging back to it stays', async ({
+    authenticatedPage: page,
+  }) => {
+    // Trent, 2026-09-22: doing early morning's reminders in the evening, the
+    // panel should move on once that slot is finished. That needs a slot
+    // BEFORE the one the day is in, which does not exist until the second
+    // slot of the day has started — `E2E_TZ` can put any run there.
+    const slots = await fetchTimeSlots(page)
+    const naturalIndex = naturalSlotIndex(slots)
+    const localNow = DateTime.now().setZone(TEST_TZ)
+    const started =
+      parseHHMM(slots[naturalIndex].start_time) <= localNow.hour * 60 + localNow.minute
+    test.skip(
+      naturalIndex === 0 || !started,
+      'no slot of the day has passed yet; set E2E_TZ to a later local time',
+    )
+    const past = slots[naturalIndex - 1]
+    const natural = slots[naturalIndex]
+    const pastAt = parseHHMM(past.start_time) + 1
+    const naturalAt = parseHHMM(natural.start_time) + 1
+
+    const ids: number[] = []
+    try {
+      ids.push(
+        await createReminder(page, {
+          title: 'Finish-past probe',
+          due_at: todayAt(Math.floor(pastAt / 60), pastAt % 60),
+        }),
+      )
+      ids.push(
+        await createReminder(page, {
+          title: 'Finish-past probe (now)',
+          due_at: todayAt(Math.floor(naturalAt / 60), naturalAt % 60),
+        }),
+      )
+
+      await page.goto('/')
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', String(natural.id))
+      await panel(page).getByRole('button', { name: 'Previous time slot' }).click()
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', String(past.id))
+
+      // The past slot's last reminder, considered: the pager moves on to the
+      // next slot with something waiting, which here is the current one.
+      await panel(page)
+        .getByRole('button', { name: 'Mark "Finish-past probe" as considered' })
+        .click()
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', String(natural.id))
+
+      // Paging back to a slot that is ALREADY finished is a choice to look
+      // at it — the pager stays there.
+      await panel(page).getByRole('button', { name: 'Previous time slot' }).click()
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', String(past.id))
+      await expect(panel(page).locator('[data-considered-toggle]')).toBeVisible()
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', String(past.id))
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('finishing the current slot goes back to the earliest one still waiting', async ({
+    authenticatedPage: page,
+  }) => {
+    // Trent, 2026-09-23: "Once I finish morning, it should take me
+    // automatically back to early morning." Needs a slot before the current
+    // one — see the test above for why and how `E2E_TZ` provides it.
+    const slots = await fetchTimeSlots(page)
+    const naturalIndex = naturalSlotIndex(slots)
+    const localNow = DateTime.now().setZone(TEST_TZ)
+    const started =
+      parseHHMM(slots[naturalIndex].start_time) <= localNow.hour * 60 + localNow.minute
+    test.skip(
+      naturalIndex === 0 || !started,
+      'no slot of the day has passed yet; set E2E_TZ to a later local time',
+    )
+    const earliest = slots[0]
+    const natural = slots[naturalIndex]
+    const earliestAt = parseHHMM(earliest.start_time) + 1
+    const naturalAt = parseHHMM(natural.start_time) + 1
+
+    const ids: number[] = []
+    try {
+      ids.push(
+        await createReminder(page, {
+          title: 'Earliest-undone probe (early)',
+          due_at: todayAt(Math.floor(earliestAt / 60), earliestAt % 60),
+        }),
+      )
+      ids.push(
+        await createReminder(page, {
+          title: 'Earliest-undone probe (now)',
+          due_at: todayAt(Math.floor(naturalAt / 60), naturalAt % 60),
+        }),
+      )
+
+      await page.goto('/')
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', String(natural.id))
+      await panel(page)
+        .getByRole('button', { name: 'Mark "Earliest-undone probe (now)" as considered' })
+        .click()
+      await expect(panel(page)).toHaveAttribute('data-reminders-slot', String(earliest.id))
+      await expect(panel(page).getByText('Earliest-undone probe (early)')).toBeVisible()
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('tapping a reminder’s text considers it; a hold still only opens its bubble', async ({
+    authenticatedPage: page,
+  }) => {
+    // Trent, 2026-09-22: "we need to be able to tap the actual text to finish
+    // the reminder... It's annoying having to tap the little circle."
+    const slots = await fetchTimeSlots(page)
+    const natural = slots[naturalSlotIndex(slots)]
+    const at = parseHHMM(natural.start_time) + 1
+    const due = todayAt(Math.floor(at / 60), at % 60)
+    const ids: number[] = []
+    try {
+      ids.push(await createReminder(page, { title: 'Tap-the-text probe', due_at: due }))
+      ids.push(await createReminder(page, { title: 'Hold-the-text probe', due_at: due }))
+      await page.goto('/')
+      const row = (title: string) => panel(page).locator('li[data-reminder-id]', { hasText: title })
+      await expect(row('Tap-the-text probe')).toBeVisible()
+
+      // A hold opens the read-only bubble and does NOT consider: the click the
+      // release leaves behind is swallowed.
+      await row('Hold-the-text probe').getByText('Hold-the-text probe').click({ delay: 500 })
+      await expect(page.locator('[data-reminder-popover]')).toBeVisible()
+      await page.keyboard.press('Escape')
+      await expect(row('Hold-the-text probe')).toBeVisible()
+
+      // A plain tap on the words considers it, with the same toast the circle gives.
+      await row('Tap-the-text probe').getByText('Tap-the-text probe').click()
+      await expect(row('Tap-the-text probe')).toHaveCount(0)
+      await expect(page.getByText('Considered \u201cTap-the-text probe\u201d')).toBeVisible()
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('considered thoughts are reachable behind a Show/Hide toggle', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const natural = slots[naturalSlotIndex(slots)]
+    const naturalStart = parseHHMM(natural.start_time) + 1
+    const title = 'Considered disclosure probe'
+
+    const ids: number[] = []
+    try {
+      ids.push(
+        await createReminder(page, {
+          title,
+          due_at: todayAt(Math.floor(naturalStart / 60), naturalStart % 60),
+        }),
+      )
+      const id = ids[0]
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+
+      // Nothing considered yet, so the count is a plain readout, not a button.
+      await expect(panel(page).locator('[data-considered-toggle]')).toHaveCount(0)
+
+      // Consider it: it leaves the waiting list...
+      const done = page.waitForResponse((r) => r.url().includes(`/api/tasks/${id}/done`))
+      await panel(page)
+        .getByRole('button', { name: `Mark "${title}" as considered` })
+        .click()
+      await done
+      await expect(panel(page).getByText(title)).toHaveCount(0)
+
+      // ...but is no longer LOST, which is the point (Trent, 2026-09-21:
+      // "I can't see the items that I considered for that day").
+      // The header's own count becomes the way in — chosen over a second
+      // full-width footer bar (Trent, 2026-09-21).
+      const toggle = panel(page).locator('[data-considered-toggle]')
+      await expect(toggle).toBeVisible()
+      await expect(toggle).toContainText('1')
+      await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+      // No caret, no colour swap, and no weight change either — the held
+      // box is the entire signal (Trent, 2026-09-21: "Don't bold the text...
+      // I like the box around it though"). Asserting the weight HOLDS is the
+      // point: a future change that reaches for bold again should fail here.
+      const readStyle = async () =>
+        toggle.evaluate((el) => ({
+          boxed: getComputedStyle(el).backgroundColor,
+          weight: getComputedStyle(el.querySelector('span')!).fontWeight,
+        }))
+      const hidden = await readStyle()
+      await toggle.click()
+      await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+      const shown = await readStyle()
+      expect(shown.boxed).not.toBe(hidden.boxed)
+      expect(shown.weight).toBe(hidden.weight)
+      await expect(panel(page).locator(`[data-considered-id="${id}"]`)).toBeVisible()
+      await expect(panel(page).getByText(title)).toBeVisible()
+
+      // Its circle puts the thought back where it was.
+      await panel(page)
+        .getByRole('button', { name: `Put back "${title}"` })
+        .click()
+      await expect(panel(page).locator('[data-considered-toggle]')).toHaveCount(0)
+      await expect(panel(page).getByText(title)).toBeVisible()
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+})
+
+test.describe('Dashboard Reminders panel — phone', () => {
+  test.use({ viewport: { width: 375, height: 812 } })
+
+  test('caps a slot at 5 rows on a phone, where 7 would fit on a desktop', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const natural = slots[naturalSlotIndex(slots)]
+    const startMinutes = parseHHMM(natural.start_time)
+    const at = (offset: number) =>
+      todayAt(Math.floor((startMinutes + offset) / 60), (startMinutes + offset) % 60)
+
+    // The SAME 7 the wide spec above shows in full. The cap is per-width —
+    // narrow is where this panel shares vertical space with the day, so it
+    // holds two back and offers the button the wide layout does not need.
+    const titles = Array.from({ length: 7 }, (_, i) => `Phone cap probe ${i}`)
+    const ids: number[] = []
+    try {
+      for (let i = 0; i < titles.length; i++) {
+        ids.push(await createReminder(page, { title: titles[i], due_at: at(i + 1) }))
+      }
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+
+      await expect(panel(page).locator('li[data-reminder-id]:visible')).toHaveCount(5)
+      const showMore = panel(page).getByRole('button', { name: /Show more/ })
+      await expect(showMore).toBeVisible()
+      await expect(showMore).toContainText('2 more')
+
+      await showMore.click()
+      await expect(panel(page).locator('li[data-reminder-id]:visible')).toHaveCount(7)
+      await expect(panel(page).getByRole('button', { name: 'Show less' })).toBeVisible()
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  test('appears inline above Track, not in a second column', async ({
+    authenticatedPage: page,
+  }) => {
+    const slots = await fetchTimeSlots(page)
+    const natural = slots[naturalSlotIndex(slots)]
+    const naturalStart = parseHHMM(natural.start_time) + 1
+
+    const ids: number[] = []
+    try {
+      // Seeded into the NATURAL slot specifically (not just "today at 7am"):
+      // the panel only shows its current page, so a reminder placed in a slot
+      // that is not showing would never be found by the text assertion below.
+      ids.push(
+        await createReminder(page, {
+          title: 'Phone panel probe',
+          due_at: todayAt(Math.floor(naturalStart / 60), naturalStart % 60),
+        }),
+      )
+      ids.push(
+        await createQuota(page, {
+          title: 'Reminders phone probe quota',
+          progress_target: 2,
+          rrule: 'FREQ=WEEKLY',
+          create_label: true,
+        }),
+      )
+
+      await page.goto('/')
+      await expect(panel(page)).toBeVisible()
+
+      const panelBox = await panel(page).boundingBox()
+      const filtersBox = await page.locator('main > div').first().boundingBox()
+      const sectionToggle = page.locator('[data-track-section-toggle]')
+      const trackToggleBox = await sectionToggle.boundingBox()
+      if (!panelBox || !filtersBox || !trackToggleBox) throw new Error('geometry not available')
+
+      // Single column: the panel shares the filters' left edge (no second
+      // grid column at this width — see `mainClass` in DashboardClient.tsx).
+      expect(Math.round(panelBox.x)).toBe(Math.round(filtersBox.x))
+      // Still above Track, same as at `xl`.
+      expect(panelBox.y).toBeLessThan(trackToggleBox.y)
+
+      await expect(panel(page).getByText('Phone panel probe')).toBeVisible()
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+})

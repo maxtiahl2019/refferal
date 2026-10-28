@@ -1,0 +1,55 @@
+/**
+ * Bulk Done API route
+ *
+ * POST /api/tasks/bulk/done - Mark multiple tasks as done
+ *
+ * Body: { ids: [1, 2, 3, ...] }
+ */
+
+import { NextRequest } from 'next/server'
+import { getAuthUser, AuthError } from '@/core/auth'
+import { success, unauthorized, handleError, handleZodError } from '@/lib/api-response'
+import { bulkDone } from '@/core/tasks'
+import { validateBulkDone } from '@/core/validation'
+import { log } from '@/lib/logger'
+import { ZodError } from 'zod'
+import { withLogging } from '@/lib/with-logging'
+import { notifyDemoEngagement } from '@/lib/demo-notify'
+
+export const POST = withLogging(async function POST(request: NextRequest) {
+  try {
+    const user = await getAuthUser(request)
+    if (!user) {
+      return unauthorized()
+    }
+
+    const body = await request.json()
+    const input = validateBulkDone(body)
+
+    const result = bulkDone({
+      userId: user.id,
+      userTimezone: user.timezone,
+      taskIds: input.ids,
+      closePeriod: input.close_period === true,
+    })
+
+    notifyDemoEngagement(user.name, 'done')
+
+    return success({
+      tasks_affected: result.tasksAffected,
+      recurring_count: result.recurringCount,
+      series_ended_count: result.seriesEndedCount,
+      one_off_count: result.oneOffCount,
+      quota_skipped: result.quotaSkipped,
+    })
+  } catch (err) {
+    if (err instanceof AuthError) {
+      return unauthorized(err.message)
+    }
+    if (err instanceof ZodError) {
+      return handleZodError(err)
+    }
+    log.error('api', 'POST /api/tasks/bulk/done error:', err)
+    return handleError(err)
+  }
+})

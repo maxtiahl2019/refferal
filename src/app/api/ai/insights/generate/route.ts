@@ -1,0 +1,95 @@
+/**
+ * SHELVED (2026-10-22): Insights (this route answers 410 FEATURE_SHELVED) is shelved behind `OPENTASK_AI_UNSHELVE`
+ * (src/core/ai/shelved.ts) until it is redesigned. The code stays in place,
+ * dormant — do not "fix" or re-enable it without Trent.
+ */
+/**
+ * POST /api/ai/insights/generate — Kick off AI insights generation
+ *
+ * Starts batch processing of all active tasks in the background.
+ * Returns immediately with a session_id for progress polling.
+ */
+
+import { NextRequest } from 'next/server'
+import { requireAuth, AuthError } from '@/core/auth'
+import {
+  isAIEnabled,
+  getUserAiContext,
+  buildTaskSummaries,
+  startInsightsGeneration,
+  getActiveInsightsSession,
+  resolveFeatureAIConfig,
+} from '@/core/ai'
+import { getUserFeatureModes } from '@/core/ai/user-context'
+import {
+  success,
+  unauthorized,
+  serviceUnavailable,
+  conflict,
+  handleError,
+  featureShelved,
+} from '@/lib/api-response'
+import { log } from '@/lib/logger'
+import { withLogging } from '@/lib/with-logging'
+import { shelvedAiFeaturesOn } from '@/core/ai/shelved'
+
+export const POST = withLogging(async function POST(request: NextRequest) {
+  try {
+    const user = await requireAuth(request)
+
+    // SHELVED (2026-10-22): src/core/ai/shelved.ts. After auth (a bad token
+    // is still a 401), before the AI-enabled check.
+    if (!shelvedAiFeaturesOn()) return featureShelved()
+
+    if (!isAIEnabled()) {
+      return serviceUnavailable('AI features are not enabled')
+    }
+
+    const modes = getUserFeatureModes(user.id)
+    if (modes.insights === 'off') {
+      return serviceUnavailable('Insights is disabled')
+    }
+
+    // Check for already-running session
+    const active = getActiveInsightsSession(user.id)
+    if (active) {
+      return conflict('Insights generation is already in progress', {
+        session_id: active.id,
+        completed: active.completed,
+        total_tasks: active.total_tasks,
+        started_at: active.started_at,
+      })
+    }
+
+    const tasks = buildTaskSummaries(user.id)
+    if (tasks.length === 0) {
+      return success({
+        session_id: null,
+        total_tasks: 0,
+        message: 'No active tasks to analyze',
+      })
+    }
+
+    const aiContext = getUserAiContext(user.id)
+    const aiConfig = resolveFeatureAIConfig('insights', modes.insights)
+    const { sessionId, totalTasks, singleCall, startedAt } = startInsightsGeneration(
+      user.id,
+      user.timezone,
+      tasks,
+      aiContext,
+      'on-demand',
+      aiConfig,
+    )
+
+    return success({
+      session_id: sessionId,
+      total_tasks: totalTasks,
+      single_call: singleCall,
+      started_at: startedAt,
+    })
+  } catch (err) {
+    if (err instanceof AuthError) return unauthorized(err.message)
+    log.error('api', 'POST /api/ai/insights/generate error:', err)
+    return handleError(err)
+  }
+})

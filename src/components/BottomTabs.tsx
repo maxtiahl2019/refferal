@@ -1,0 +1,138 @@
+'use client'
+
+import { GuardedLink } from './GuardedLink'
+import { usePathname } from 'next/navigation'
+import { LayoutGrid, Plus, Clock, Lightbulb, Gauge } from 'lucide-react'
+import { useRemindersBadge } from '@/hooks/useReminders'
+import { useTaskNavCounts } from '@/hooks/useTaskNavCounts'
+import { useDashboardTabClick } from '@/hooks/useDashboardTabClick'
+import { useTimezone } from '@/hooks/useTimezone'
+
+interface BottomTabsProps {
+  onAddClick?: () => void
+}
+
+/**
+ * The tab badge.
+ *
+ * Anchored to the icon's top-right corner and growing OUTWARD from it, because
+ * the count is routinely wider than the 20px icon it sits on — three digits is
+ * an ordinary Tuesday here. A right-anchored badge grows leftward instead, and
+ * at three digits it covers the icon completely, which is what this looked like
+ * before: a number printed over a glyph.
+ *
+ * Absolutely positioned, so the width of the number never moves the tab it
+ * belongs to and the five tabs keep their spacing whatever the counts are. The
+ * ring is the separation: it punches a background-colored gap between badge and
+ * icon so the small overlap at the corner reads as deliberate.
+ */
+const BADGE =
+  'text-destructive-foreground absolute -top-1.5 left-full -ml-1.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] leading-none font-bold tabular-nums ring-2 ring-background'
+
+/** Four digits would reach the next tab; the house cap (see Header) is 999+. */
+function capCount(n: number): string {
+  return n > 999 ? '999+' : String(n)
+}
+
+/**
+ * Mobile tab bar.
+ *
+ * Reminders (§6) is a destination, not a setting, so it takes a tab; Settings and
+ * Trash moved into the dashboard header's menu, which is the only overflow surface
+ * mobile has. Five slots is the ceiling — the centre one is the Add action, so four
+ * destinations is all there is to allocate.
+ */
+export function BottomTabs({ onAddClick }: BottomTabsProps) {
+  const pathname = usePathname()
+  // §6: reminders waiting so far today — never overdue, never red.
+  const remindersWaiting = useRemindersBadge(useTimezone())
+  // One badge fits a tab: overdue (red) when there is any, else due today (blue).
+  const taskCounts = useTaskNavCounts()
+  const onDashboardClick = useDashboardTabClick()
+  const tasksBadge =
+    taskCounts && taskCounts.overdue > 0
+      ? { n: taskCounts.overdue, label: `${taskCounts.overdue} overdue`, tone: 'overdue' }
+      : taskCounts && taskCounts.today > 0
+        ? { n: taskCounts.today, label: `${taskCounts.today} for today`, tone: 'today' }
+        : null
+
+  const tabs = [
+    { href: '/', label: 'Dashboard', icon: LayoutGrid },
+    // Lightbulb is the Reminders surface's own icon (see RemindersView's empty state).
+    { href: '/reminders', label: 'Reminders', icon: Lightbulb },
+    { href: '#add', label: 'Add', icon: Plus, isAction: true },
+    // Quotas takes the slot Archive had. Five is the ceiling and one of the
+    // four destinations had to go: quotas are a daily surface now (§5, and
+    // Trent asked for them to be first-class on 2026-09-06), while Archive is
+    // occasional and still reachable from the header menu — the same place
+    // Settings and Trash already live on a phone.
+    { href: '/quotas', label: 'Quotas', icon: Gauge },
+    { href: '/history', label: 'History', icon: Clock },
+  ]
+
+  return (
+    <nav className="safe-bottom border-border bg-background fixed right-0 bottom-0 left-0 z-20 border-t select-none md:hidden">
+      <div className="flex items-center justify-around px-2 pt-1">
+        {tabs.map((tab) => {
+          const isActive =
+            tab.href === '/'
+              ? pathname === '/'
+              : pathname.startsWith(tab.href) && tab.href !== '#add'
+          const Icon = tab.icon
+
+          if (tab.isAction) {
+            return (
+              <button
+                key={tab.label}
+                onClick={onAddClick}
+                aria-label={tab.label}
+                className="-mt-3 flex flex-col items-center justify-center p-2"
+              >
+                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-blue-500 shadow-lg">
+                  <Icon className="h-6 w-6 text-white" strokeWidth={2.5} />
+                </div>
+              </button>
+            )
+          }
+
+          return (
+            <GuardedLink
+              key={tab.label}
+              href={tab.href}
+              aria-label={tab.label}
+              onClick={tab.href === '/' ? onDashboardClick : undefined}
+              className={`flex min-w-[48px] flex-col items-center justify-center rounded-lg p-2 ${
+                isActive ? 'text-blue-500' : 'text-muted-foreground'
+              }`}
+            >
+              <span className="relative inline-flex">
+                <Icon className="h-5 w-5" />
+                {tab.href === '/' && tasksBadge && (
+                  <span
+                    data-tasks-badge
+                    className={`${BADGE} ${
+                      tasksBadge.tone === 'overdue' ? 'bg-over-target-badge' : 'bg-blue-500'
+                    }`}
+                    aria-label={tasksBadge.label}
+                  >
+                    {capCount(tasksBadge.n)}
+                  </span>
+                )}
+                {tab.href === '/reminders' && remindersWaiting > 0 && (
+                  <span
+                    data-reminders-badge
+                    className={`${BADGE} bg-badge-reminders`}
+                    aria-label={`${remindersWaiting} reminders waiting so far today`}
+                  >
+                    {capCount(remindersWaiting)}
+                  </span>
+                )}
+              </span>
+              <span className="mt-0.5 text-[10px]">{tab.label}</span>
+            </GuardedLink>
+          )
+        })}
+      </div>
+    </nav>
+  )
+}

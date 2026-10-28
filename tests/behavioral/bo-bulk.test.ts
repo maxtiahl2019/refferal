@@ -1,0 +1,2096 @@
+/**
+ * Bulk Operations Behavioral Tests (BO-001 through BO-005, BE-001 through BE-004)
+ *
+ * Tests bulk operations with atomicity and undo integration.
+ * BE tests focus on bulkEdit snooze and recurrence behavior.
+ */
+
+import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest'
+import { getDb } from '@/core/db'
+import { createTask, getTaskById } from '@/core/tasks'
+import { bulkDone, bulkSnooze, bulkEdit, type BulkEditChanges } from '@/core/tasks/bulk'
+import { snoozeTask } from '@/core/tasks/snooze'
+import { executeUndo, canUndo, getUndoHistory } from '@/core/undo'
+import { DateTime } from 'luxon'
+import {
+  setupTestDb,
+  teardownTestDb,
+  localTime,
+  TEST_USER_ID,
+  TEST_TIMEZONE,
+  seedTestLabels,
+  madeBefore,
+} from '../helpers/setup'
+
+describe('Bulk Operations Behavioral Tests', () => {
+  beforeEach(() => {
+    // Freeze time to Jan 15, 2026 at 10am Chicago (16:00 UTC)
+    // This ensures localTime(8, 0) creates a time 2 hours in the past
+    vi.setSystemTime(new Date('2026-01-15T16:00:00Z'))
+    setupTestDb()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    teardownTestDb()
+  })
+
+  /**
+   * BO-001: Bulk Done Applies Recurrence Logic
+   *
+   * All tasks in a bulk-done have their recurrence correctly computed. No shortcuts.
+   */
+  test('BO-001: Bulk done applies recurrence logic correctly to each task', () => {
+    // Create multiple recurring tasks with different RRULEs
+    const dailyTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: '[M] Daily task',
+        due_at: localTime(8, 0),
+        rrule: 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0',
+      },
+    })
+
+    const weeklyTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: '[M] Weekly task',
+        due_at: localTime(9, 0),
+        rrule: 'FREQ=WEEKLY;BYHOUR=9;BYMINUTE=0',
+      },
+    })
+
+    // Get original due dates
+    const dailyOriginal = dailyTask.due_at
+    const weeklyOriginal = weeklyTask.due_at
+
+    // Bulk mark done
+    const result = bulkDone({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [dailyTask.id, weeklyTask.id],
+    })
+
+    expect(result.tasksAffected).toBe(2)
+    expect(result.recurringCount).toBe(2)
+    expect(result.oneOffCount).toBe(0)
+
+    // Verify daily task advanced
+    const updatedDaily = getTaskById(dailyTask.id)!
+    const dailyNextDt = DateTime.fromISO(updatedDaily.due_at!).setZone(TEST_TIMEZONE)
+    expect(dailyNextDt.hour).toBe(8)
+    expect(dailyNextDt.minute).toBe(0)
+    expect(updatedDaily.due_at).not.toBe(dailyOriginal)
+
+    // Verify weekly task advanced
+    const updatedWeekly = getTaskById(weeklyTask.id)!
+    const weeklyNextDt = DateTime.fromISO(updatedWeekly.due_at!).setZone(TEST_TIMEZONE)
+    expect(weeklyNextDt.hour).toBe(9)
+    expect(weeklyNextDt.minute).toBe(0)
+    expect(updatedWeekly.due_at).not.toBe(weeklyOriginal)
+  })
+
+  /**
+   * BO-002: Bulk Operations Are Atomic
+   *
+   * A bulk operation either succeeds entirely or fails entirely (SQL transaction).
+   * Invalid IDs cause the entire batch to fail.
+   */
+  test('BO-002: Bulk operations fail atomically on invalid task ID', () => {
+    // Create one valid task
+    const validTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Valid task',
+        due_at: localTime(8, 0),
+        rrule: 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0',
+      },
+    })
+
+    const originalDueAt = validTask.due_at
+
+    // Try bulk done with one valid ID and one invalid ID
+    expect(() =>
+      bulkDone({
+        userId: TEST_USER_ID,
+        userTimezone: TEST_TIMEZONE,
+        taskIds: [validTask.id, 99999], // 99999 doesn't exist
+      }),
+    ).toThrow('Invalid task IDs: 99999')
+
+    // Verify valid task was NOT modified (atomic rollback)
+    const unchangedTask = getTaskById(validTask.id)!
+    expect(unchangedTask.due_at).toBe(originalDueAt)
+  })
+
+  /**
+   * BO-003: Bulk Done at Scale
+   *
+   * 100+ tasks in a single bulk-done without performance degradation or data corruption.
+   */
+  test('BO-003: Bulk done handles 100+ tasks', () => {
+    const taskIds: number[] = []
+
+    // Create 100 recurring tasks
+    for (let i = 0; i < 100; i++) {
+      const task = createTask({
+        userId: TEST_USER_ID,
+        userTimezone: TEST_TIMEZONE,
+        input: {
+          title: `Task ${i + 1}`,
+          due_at: localTime(8, 0),
+          rrule: 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0',
+        },
+      })
+      taskIds.push(task.id)
+    }
+
+    // Capture original due dates
+    const originalDueDates = taskIds.map((id) => getTaskById(id)!.due_at)
+
+    // Bulk mark done
+    const startTime = Date.now()
+    const result = bulkDone({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds,
+    })
+    const elapsed = Date.now() - startTime
+
+    // Should complete in reasonable time (< 5 seconds for 100 tasks)
+    expect(elapsed).toBeLessThan(5000)
+
+    expect(result.tasksAffected).toBe(100)
+    expect(result.recurringCount).toBe(100)
+
+    // Verify all tasks were advanced
+    for (let i = 0; i < taskIds.length; i++) {
+      const updatedTask = getTaskById(taskIds[i])!
+      expect(updatedTask.due_at).not.toBe(originalDueDates[i])
+      expect(updatedTask.done).toBe(false) // Recurring tasks stay undone
+
+      // Verify correct time
+      const nextDt = DateTime.fromISO(updatedTask.due_at!).setZone(TEST_TIMEZONE)
+      expect(nextDt.hour).toBe(8)
+      expect(nextDt.minute).toBe(0)
+    }
+
+    // Verify completions were created for all tasks
+    const db = getDb()
+    const completionCount = db.prepare('SELECT COUNT(*) as count FROM completions').get() as {
+      count: number
+    }
+    expect(completionCount.count).toBe(100)
+  })
+})
+
+describe('Bulk Operations Undo & Mixed Types', () => {
+  beforeEach(() => {
+    // Freeze time to Jan 15, 2026 at 10am Chicago (16:00 UTC)
+    vi.setSystemTime(new Date('2026-01-15T16:00:00Z'))
+    setupTestDb()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    teardownTestDb()
+  })
+
+  /**
+   * BO-004: Bulk Operations Are Single Undo Entry
+   *
+   * A bulk-done of 63 tasks is reversed by a single undo action.
+   */
+  test('BO-004: Bulk done creates single undo entry', () => {
+    const taskIds: number[] = []
+    const originalDueDates: (string | null)[] = []
+
+    // Create 10 recurring tasks
+    for (let i = 0; i < 10; i++) {
+      const task = createTask({
+        userId: TEST_USER_ID,
+        userTimezone: TEST_TIMEZONE,
+        input: {
+          title: `Task ${i + 1}`,
+          due_at: localTime(8, 0),
+          rrule: 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0',
+        },
+      })
+      taskIds.push(task.id)
+      originalDueDates.push(task.due_at)
+    }
+
+    // Bulk mark done
+    bulkDone({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds,
+    })
+
+    // Verify undo history has exactly one entry for this bulk operation
+    const history = getUndoHistory(TEST_USER_ID, 20)
+    // Filter to just bulk_done entries (there may be create entries too)
+    const bulkDoneEntries = history.filter((e) => e.action === 'bulk_done')
+    expect(bulkDoneEntries.length).toBe(1)
+    expect(bulkDoneEntries[0].description).toBe('Marked 10 tasks done')
+
+    // Verify can undo
+    expect(canUndo(TEST_USER_ID)).toBe(true)
+
+    // Execute single undo
+    const undoResult = executeUndo(TEST_USER_ID)
+    expect(undoResult).not.toBeNull()
+    expect(undoResult!.undone_action).toBe('bulk_done')
+    expect(undoResult!.tasks_affected).toBe(10)
+
+    // Verify ALL tasks were reverted
+    for (let i = 0; i < taskIds.length; i++) {
+      const revertedTask = getTaskById(taskIds[i])!
+      expect(revertedTask.due_at).toBe(originalDueDates[i])
+    }
+
+    // Verify completions were deleted
+    const db = getDb()
+    const completionCount = db.prepare('SELECT COUNT(*) as count FROM completions').get() as {
+      count: number
+    }
+    expect(completionCount.count).toBe(0)
+  })
+
+  /**
+   * BO-005: Bulk Mixed Types
+   *
+   * Bulk done handles both recurring (advance) and one-off (archive) tasks in the same batch.
+   */
+  test('BO-005: Bulk done handles mixed recurring and one-off tasks', () => {
+    // Create recurring task
+    const recurringTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: '[M] Recurring task',
+        due_at: localTime(8, 0),
+        rrule: 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0',
+      },
+    })
+
+    // Create one-off task
+    const oneOffTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'One-off task',
+        due_at: localTime(9, 0),
+      },
+    })
+
+    const recurringOriginalDueAt = recurringTask.due_at
+
+    // Bulk mark done both
+    const result = bulkDone({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [recurringTask.id, oneOffTask.id],
+    })
+
+    expect(result.tasksAffected).toBe(2)
+    expect(result.recurringCount).toBe(1)
+    expect(result.oneOffCount).toBe(1)
+
+    // Verify recurring task advanced (not done, but due_at changed)
+    const updatedRecurring = getTaskById(recurringTask.id)!
+    expect(updatedRecurring.done).toBe(false) // Recurring stays undone
+    expect(updatedRecurring.due_at).not.toBe(recurringOriginalDueAt)
+    expect(updatedRecurring.archived_at).toBeNull()
+
+    // Verify one-off task is done and archived
+    const updatedOneOff = getTaskById(oneOffTask.id)!
+    expect(updatedOneOff.done).toBe(true)
+    expect(updatedOneOff.done_at).not.toBeNull()
+    expect(updatedOneOff.archived_at).not.toBeNull()
+
+    // Verify single undo entry was created
+    const history = getUndoHistory(TEST_USER_ID, 20)
+    const bulkDoneEntries = history.filter((e) => e.action === 'bulk_done')
+    expect(bulkDoneEntries.length).toBe(1)
+
+    // Undo should revert both
+    const undoResult = executeUndo(TEST_USER_ID)
+    expect(undoResult!.tasks_affected).toBe(2)
+
+    // Verify recurring task reverted
+    const revertedRecurring = getTaskById(recurringTask.id)!
+    expect(revertedRecurring.due_at).toBe(recurringOriginalDueAt)
+
+    // Verify one-off task reverted to not done
+    const revertedOneOff = getTaskById(oneOffTask.id)!
+    expect(revertedOneOff.done).toBe(false)
+    expect(revertedOneOff.done_at).toBeNull()
+    expect(revertedOneOff.archived_at).toBeNull()
+  })
+})
+
+describe('Bulk Snooze Relative Mode', () => {
+  beforeEach(() => {
+    // Freeze time to Jan 15, 2026 at 10am Chicago (16:00 UTC)
+    vi.setSystemTime(new Date('2026-01-15T16:00:00Z'))
+    setupTestDb()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    teardownTestDb()
+  })
+
+  /**
+   * BS-001: Bulk snooze with delta adds minutes to each task's current due_at
+   */
+  test('BS-001: Relative snooze adds delta to each task individually', () => {
+    // Create tasks with different due dates
+    const task1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Task 1',
+        due_at: localTime(8, 0), // Jan 15, 8:00 AM
+      },
+    })
+
+    const task2 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Task 2',
+        due_at: localTime(14, 30), // Jan 15, 2:30 PM
+      },
+    })
+
+    const task1OriginalDueAt = new Date(task1.due_at!)
+    const task2OriginalDueAt = new Date(task2.due_at!)
+
+    // Bulk snooze with delta of +90 minutes
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task1.id, task2.id],
+      deltaMinutes: 90,
+    })
+
+    expect(result.tasksAffected).toBe(2)
+
+    // Verify each task was snoozed by 90 minutes from its own due date
+    const updatedTask1 = getTaskById(task1.id)!
+    const updatedTask2 = getTaskById(task2.id)!
+
+    const task1NewDueAt = new Date(updatedTask1.due_at!)
+    const task2NewDueAt = new Date(updatedTask2.due_at!)
+
+    // Task 1: 8:00 AM + 90 min = 9:30 AM
+    expect(task1NewDueAt.getTime()).toBe(task1OriginalDueAt.getTime() + 90 * 60 * 1000)
+
+    // Task 2: 2:30 PM + 90 min = 4:00 PM
+    expect(task2NewDueAt.getTime()).toBe(task2OriginalDueAt.getTime() + 90 * 60 * 1000)
+
+    // Verify original_due_at was set correctly
+    expect(updatedTask1.original_due_at).toBe(task1.due_at)
+    expect(updatedTask2.original_due_at).toBe(task2.due_at)
+  })
+
+  /**
+   * BS-002: Bulk snooze relative handles negative delta (going back in time)
+   */
+  test('BS-002: Relative snooze supports negative delta', () => {
+    const task = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Task',
+        due_at: localTime(14, 0), // 2:00 PM
+      },
+    })
+
+    const originalDueAt = new Date(task.due_at!)
+
+    // Snooze backwards by 30 minutes
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task.id],
+      deltaMinutes: -30,
+    })
+
+    expect(result.tasksAffected).toBe(1)
+
+    const updatedTask = getTaskById(task.id)!
+    const newDueAt = new Date(updatedTask.due_at!)
+
+    // 2:00 PM - 30 min = 1:30 PM
+    expect(newDueAt.getTime()).toBe(originalDueAt.getTime() - 30 * 60 * 1000)
+  })
+
+  /**
+   * BS-002b: the result names exactly which ids moved.
+   *
+   * The snooze-overdue route relies on this instead of walking
+   * `getCurrentlyDueTaskIds()` a second time and diffing — a per-recurring-task
+   * rrule evaluation to recover something bulkSnooze already knew. If this
+   * contract silently drops back to an empty array the route stops dismissing
+   * notifications at all, which is invisible in the response body.
+   */
+  test('BS-002b: snoozedIds names the tasks that actually moved, and excludes the skipped', () => {
+    const moved = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Ordinary task', due_at: localTime(9, 0), priority: 1 },
+    })
+    // P4 Urgent is excluded from a bulk sweep, so it must not appear.
+    const urgent = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent task', due_at: localTime(9, 0), priority: 4 },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [moved.id, urgent.id],
+      deltaMinutes: 60,
+    })
+
+    expect(result.tasksAffected).toBe(1)
+    expect(result.snoozedIds).toEqual([moved.id])
+    expect(result.snoozedIds).not.toContain(urgent.id)
+    expect(result.snoozedIds).toHaveLength(result.tasksAffected)
+  })
+
+  /**
+   * The double snooze (Trent, 2026-09-22): High is swept only once nothing
+   * lower is left, so the first press moves the ordinary task and skips High,
+   * and the second moves High alone — which `highSnoozed` reports, so the
+   * toast can say "Snoozed 1 high-priority task".
+   */
+  test('BS-002d: highSnoozed counts the High tasks moved — none on press one, all on press two', () => {
+    const ordinary = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Ordinary for the double snooze', due_at: localTime(9, 0), priority: 1 },
+    })
+    const high = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'High for the double snooze', due_at: localTime(9, 0), priority: 3 },
+    })
+
+    const first = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [ordinary.id, high.id],
+      deltaMinutes: 60,
+    })
+    expect(first.snoozedIds).toEqual([ordinary.id])
+    expect(first.highSkipped).toBe(1)
+    expect(first.highSnoozed).toBe(0)
+
+    const second = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [high.id],
+      deltaMinutes: 60,
+    })
+    expect(second.snoozedIds).toEqual([high.id])
+    expect(second.highSnoozed).toBe(1)
+    expect(second.highSnoozed).toBe(second.tasksAffected)
+  })
+
+  /** Nothing eligible means nothing claimed. */
+  test('BS-002c: snoozedIds is empty when every task is skipped', () => {
+    const urgent = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Only urgent', due_at: localTime(9, 0), priority: 4 },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [urgent.id],
+      deltaMinutes: 60,
+    })
+
+    expect(result.tasksAffected).toBe(0)
+    expect(result.snoozedIds).toEqual([])
+  })
+
+  /**
+   * BS-003: Relative snooze skips tasks with null due_at
+   */
+  test('BS-003: Relative snooze skips tasks with null due_at', () => {
+    const task = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Task with no due date',
+        // No due_at
+      },
+    })
+
+    expect(task.due_at).toBeNull()
+
+    // Snooze by +60 minutes — should skip since task has no due_at
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task.id],
+      deltaMinutes: 60,
+    })
+
+    expect(result.tasksAffected).toBe(0)
+    expect(result.noDueDateSkipped).toBe(1)
+    expect(result.tasksSkipped).toBe(1)
+
+    // Task should be unchanged
+    const updatedTask = getTaskById(task.id)!
+    expect(updatedTask.due_at).toBeNull()
+    expect(updatedTask.original_due_at).toBeNull()
+  })
+
+  /**
+   * BS-003b: Relative snooze processes tasks with due_at, skips those without
+   */
+  test('BS-003b: Mixed due-date selection — relative snooze only affects tasks with due_at', () => {
+    const taskWithDue = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Has due date',
+        due_at: localTime(8, 0),
+      },
+    })
+    const taskWithout = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'No due date',
+      },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [taskWithDue.id, taskWithout.id],
+      deltaMinutes: 60,
+    })
+
+    expect(result.tasksAffected).toBe(1)
+    expect(result.noDueDateSkipped).toBe(1)
+
+    // Task with due date was snoozed
+    const updatedWithDue = getTaskById(taskWithDue.id)!
+    const expectedDueAt = new Date(new Date(localTime(8, 0)).getTime() + 60 * 60 * 1000)
+    expect(new Date(updatedWithDue.due_at!).getTime()).toBe(expectedDueAt.getTime())
+
+    // Task without due date is unchanged
+    const updatedWithout = getTaskById(taskWithout.id)!
+    expect(updatedWithout.due_at).toBeNull()
+  })
+
+  /**
+   * BS-004: Bulk snooze relative creates single undo entry
+   */
+  test('BS-004: Relative snooze creates single undo entry', () => {
+    const task1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Task 1',
+        due_at: localTime(8, 0),
+      },
+    })
+
+    const task2 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Task 2',
+        due_at: localTime(9, 0),
+      },
+    })
+
+    const task1Original = task1.due_at
+    const task2Original = task2.due_at
+
+    // Bulk snooze
+    bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task1.id, task2.id],
+      deltaMinutes: 60,
+    })
+
+    // Verify single undo entry
+    const history = getUndoHistory(TEST_USER_ID, 20)
+    const bulkSnoozeEntries = history.filter((e) => e.action === 'bulk_snooze')
+    expect(bulkSnoozeEntries.length).toBe(1)
+    expect(bulkSnoozeEntries[0].description).toBe('Deferred 2 tasks (+1h)')
+
+    // Undo should revert both
+    expect(canUndo(TEST_USER_ID)).toBe(true)
+    const undoResult = executeUndo(TEST_USER_ID)
+    expect(undoResult!.tasks_affected).toBe(2)
+
+    // Verify both reverted
+    const revertedTask1 = getTaskById(task1.id)!
+    const revertedTask2 = getTaskById(task2.id)!
+
+    expect(revertedTask1.due_at).toBe(task1Original)
+    expect(revertedTask2.due_at).toBe(task2Original)
+    // original_due_at was set at creation and preserved through snooze/undo
+    expect(revertedTask1.original_due_at).toBe(task1Original)
+    expect(revertedTask2.original_due_at).toBe(task2Original)
+  })
+
+  /**
+   * BS-005: Absolute vs relative mode validation
+   */
+  test('BS-005: Cannot provide both until and deltaMinutes', () => {
+    const task = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Task',
+        due_at: localTime(8, 0),
+      },
+    })
+
+    expect(() =>
+      bulkSnooze({
+        userId: TEST_USER_ID,
+        userTimezone: TEST_TIMEZONE,
+        taskIds: [task.id],
+        until: localTime(12, 0),
+        deltaMinutes: 60,
+      }),
+    ).toThrow('Cannot provide both until and deltaMinutes')
+  })
+
+  /**
+   * BS-006: Must provide either until or deltaMinutes
+   */
+  test('BS-006: Must provide either until or deltaMinutes', () => {
+    const task = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Task',
+        due_at: localTime(8, 0),
+      },
+    })
+
+    expect(() =>
+      bulkSnooze({
+        userId: TEST_USER_ID,
+        userTimezone: TEST_TIMEZONE,
+        taskIds: [task.id],
+        // Neither until nor deltaMinutes provided
+      }),
+    ).toThrow('Either until or deltaMinutes must be provided')
+  })
+
+  /**
+   * BS-007: Absolute mode still works
+   */
+  test('BS-007: Absolute mode sets all tasks to same time', () => {
+    const task1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Task 1',
+        due_at: localTime(8, 0),
+      },
+    })
+
+    const task2 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Task 2',
+        due_at: localTime(14, 0),
+      },
+    })
+
+    const targetTime = localTime(18, 0) // 6:00 PM
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task1.id, task2.id],
+      until: targetTime,
+    })
+
+    expect(result.tasksAffected).toBe(2)
+
+    // Both tasks should have the same due_at
+    const updatedTask1 = getTaskById(task1.id)!
+    const updatedTask2 = getTaskById(task2.id)!
+
+    expect(updatedTask1.due_at).toBe(targetTime)
+    expect(updatedTask2.due_at).toBe(targetTime)
+  })
+})
+
+/**
+ * Bulk Edit Snooze and Recurrence Tests (BE-001 through BE-004)
+ *
+ * Tests bulkEdit behavior with due_at and rrule changes,
+ * verifying snooze logic and recurrence handling.
+ */
+describe('Bulk Edit Snooze & Recurrence', () => {
+  beforeEach(() => {
+    // Freeze time to Jan 15, 2026 at 10am Chicago (16:00 UTC)
+    vi.setSystemTime(new Date('2026-01-15T16:00:00Z'))
+    setupTestDb()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    teardownTestDb()
+  })
+
+  /**
+   * BE-001: bulkEdit with due_at changes applies snooze logic
+   *
+   * When bulkEdit is called with only due_at changes (no rrule change), each
+   * is a move (§6, 2026-10-12): the first-target date is kept, nothing is
+   * counted.
+   *
+   * Action: bulkEdit with { due_at: tomorrow } on multiple tasks
+   * Result: due_at moved, original_due_at kept for each
+   */
+  test('BE-001: bulkEdit with due_at changes applies snooze logic', () => {
+    // Create multiple tasks with different due dates
+    const task1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Task 1',
+        due_at: localTime(8, 0), // Today 8 AM
+      },
+    })
+
+    const task2 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Task 2',
+        due_at: localTime(14, 0), // Today 2 PM
+      },
+    })
+
+    // Verify initial state — original_due_at is set eagerly at creation time
+    expect(task1.original_due_at).toBe(task1.due_at)
+    expect(task2.original_due_at).toBe(task2.due_at)
+
+    const originalTask1DueAt = task1.due_at
+    const originalTask2DueAt = task2.due_at
+
+    // Bulk edit with due_at change (this is effectively a snooze)
+    const newDueAt = localTime(18, 0, 1) // Tomorrow 6 PM
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task1.id, task2.id],
+      changes: { due_at: newDueAt },
+    })
+
+    expect(result.tasksAffected).toBe(2)
+
+    // Verify snooze logic was applied
+    const updatedTask1 = getTaskById(task1.id)!
+    const updatedTask2 = getTaskById(task2.id)!
+
+    // due_at changed
+    expect(updatedTask1.due_at).toBe(newDueAt)
+    expect(updatedTask2.due_at).toBe(newDueAt)
+
+    // original_due_at captured the original values
+    expect(updatedTask1.original_due_at).toBe(originalTask1DueAt)
+    expect(updatedTask2.original_due_at).toBe(originalTask2DueAt)
+
+    // No snooze state is recorded
+    expect(updatedTask1).not.toHaveProperty('snooze_count')
+  })
+
+  /**
+   * BE-002: bulkEdit with due_at + rrule does NOT apply snooze logic
+   *
+   * When bulkEdit includes both due_at and rrule changes, snooze logic
+   * is NOT applied because rrule change takes precedence (schedule change).
+   *
+   * Action: bulkEdit with { due_at: tomorrow, rrule: 'FREQ=DAILY' }
+   * Result: a re-schedule — the date is honored, the old origin dropped
+   */
+  test('BE-002: bulkEdit with due_at + rrule does NOT apply snooze logic', () => {
+    const task = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'One-off task',
+        due_at: localTime(8, 0), // Today 8 AM
+      },
+    })
+
+    // Bulk edit with both due_at and rrule
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task.id],
+      changes: {
+        due_at: localTime(18, 0, 1), // Tomorrow 6 PM
+        rrule: 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0',
+      },
+    })
+
+    expect(result.tasksAffected).toBe(1)
+
+    const updatedTask = getTaskById(task.id)!
+
+    // rrule change takes precedence - a re-schedule, not a move: the date is
+    // the new schedule's occurrence and the old origin goes
+    expect(updatedTask.due_at).toBe(localTime(18, 0, 1))
+    expect(updatedTask.occurrence_at).toBe(localTime(18, 0, 1))
+    expect(updatedTask.original_due_at).toBeNull()
+
+    // Task is now recurring
+    expect(updatedTask.rrule).toBe('FREQ=DAILY;BYHOUR=9;BYMINUTE=0')
+  })
+
+  /**
+   * BE-003: bulkEdit rrule change keeps a moved target's origin
+   *
+   * PR 4a (2026-10-22, ruling A1): a snoozed (moved) target is the
+   * occurrence's own, so a schedule change keeps it and its origin
+   * (original_due_at) — the same rule as a single PATCH (SN-011).
+   *
+   * Task: multiple snoozed tasks
+   * Action: bulkEdit with { rrule: 'FREQ=WEEKLY;BYDAY=MO' }
+   * Result: original_due_at kept for all
+   */
+  test('BE-003: bulkEdit rrule change keeps a moved target and its origin', () => {
+    // Create recurring tasks and snooze them
+    const task1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Daily task 1',
+        due_at: localTime(8, 0, 1), // Tomorrow 8 AM
+        rrule: 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0',
+      },
+    })
+
+    const task2 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: {
+        title: 'Daily task 2',
+        due_at: localTime(9, 0, 1), // Tomorrow 9 AM
+        rrule: 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0',
+      },
+    })
+
+    // Snooze both tasks
+    snoozeTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskId: task1.id,
+      until: localTime(14, 0, 1), // Tomorrow 2 PM
+    })
+    snoozeTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskId: task2.id,
+      until: localTime(15, 0, 1), // Tomorrow 3 PM
+    })
+
+    // Verify snoozed state
+    const snoozedTask1 = getTaskById(task1.id)!
+    const snoozedTask2 = getTaskById(task2.id)!
+    expect(snoozedTask1.original_due_at).not.toBeNull()
+    expect(snoozedTask2.original_due_at).not.toBeNull()
+
+    // Bulk edit to change rrule
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task1.id, task2.id],
+      changes: { rrule: 'FREQ=WEEKLY;BYDAY=MO;BYHOUR=10;BYMINUTE=0' },
+    })
+
+    expect(result.tasksAffected).toBe(2)
+
+    // The moved targets and their origins stay (PR 4a)
+    const updatedTask1 = getTaskById(task1.id)!
+    const updatedTask2 = getTaskById(task2.id)!
+
+    expect(updatedTask1.original_due_at).toBe(snoozedTask1.original_due_at)
+    expect(updatedTask2.original_due_at).toBe(snoozedTask2.original_due_at)
+    expect(updatedTask1.due_at).toBe(snoozedTask1.due_at)
+    expect(updatedTask2.due_at).toBe(snoozedTask2.due_at)
+
+    // New rrule applied
+    expect(updatedTask1.rrule).toBe('FREQ=WEEKLY;BYDAY=MO;BYHOUR=10;BYMINUTE=0')
+    expect(updatedTask2.rrule).toBe('FREQ=WEEKLY;BYDAY=MO;BYHOUR=10;BYMINUTE=0')
+  })
+
+  /**
+   * BE-004: bulkEdit rrule change on overdue tasks preserves due_at
+   *
+   * When bulkEdit changes rrule on overdue tasks, due_at is preserved
+   * (not auto-computed) so tasks remain overdue.
+   *
+   * Task: multiple overdue tasks
+   * Action: bulkEdit with { rrule: 'FREQ=WEEKLY;BYDAY=MO' }
+   * Result: due_at unchanged (all still overdue)
+   */
+  test('BE-004: bulkEdit rrule change on overdue tasks preserves due_at', () => {
+    // Create overdue tasks (due yesterday)
+    const yesterdayDueAt1 = localTime(8, 0, -1) // Yesterday 8 AM
+    const yesterdayDueAt2 = localTime(9, 0, -1) // Yesterday 9 AM
+
+    // Made while their dates were still ahead (a new repeat with a past date
+    // would start at its next occurrence instead).
+    const task1 = madeBefore(yesterdayDueAt1, () =>
+      createTask({
+        userId: TEST_USER_ID,
+        userTimezone: TEST_TIMEZONE,
+        input: {
+          title: 'Overdue task 1',
+          due_at: yesterdayDueAt1,
+          rrule: 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0',
+        },
+      }),
+    )
+
+    const task2 = madeBefore(yesterdayDueAt1, () =>
+      createTask({
+        userId: TEST_USER_ID,
+        userTimezone: TEST_TIMEZONE,
+        input: {
+          title: 'Overdue task 2',
+          due_at: yesterdayDueAt2,
+          rrule: 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0',
+        },
+      }),
+    )
+
+    // Verify tasks are overdue
+    expect(new Date(task1.due_at!).getTime()).toBeLessThan(Date.now())
+    expect(new Date(task2.due_at!).getTime()).toBeLessThan(Date.now())
+
+    // Bulk edit to change rrule
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task1.id, task2.id],
+      changes: { rrule: 'FREQ=WEEKLY;BYDAY=MO;BYHOUR=10;BYMINUTE=0' },
+    })
+
+    expect(result.tasksAffected).toBe(2)
+
+    // due_at should be UNCHANGED (still overdue)
+    const updatedTask1 = getTaskById(task1.id)!
+    const updatedTask2 = getTaskById(task2.id)!
+
+    expect(updatedTask1.due_at).toBe(yesterdayDueAt1)
+    expect(updatedTask2.due_at).toBe(yesterdayDueAt2)
+
+    // Still overdue
+    expect(new Date(updatedTask1.due_at!).getTime()).toBeLessThan(Date.now())
+    expect(new Date(updatedTask2.due_at!).getTime()).toBeLessThan(Date.now())
+
+    // New rrule and anchors applied
+    expect(updatedTask1.rrule).toBe('FREQ=WEEKLY;BYDAY=MO;BYHOUR=10;BYMINUTE=0')
+    expect(updatedTask1.anchor_time).toBe('10:00')
+    expect(updatedTask1.anchor_dow).toBe(0) // Monday
+  })
+})
+
+/**
+ * Bulk Edit Labels — Additive/Subtractive Tests (BL-001 through BL-007)
+ *
+ * Tests labels_add and labels_remove in bulkEdit, verifying case-insensitive
+ * dedup, proper undo snapshots, and interaction with full labels replacement.
+ */
+describe('Bulk Edit Labels (labels_add/labels_remove)', () => {
+  beforeEach(() => {
+    vi.setSystemTime(new Date('2026-01-15T16:00:00Z'))
+    setupTestDb()
+    // §7.2: this suite exercises additive/subtractive label ops, not registry
+    // gating, so the user starts with an established taxonomy.
+    seedTestLabels(['Work', 'Personal', 'Urgent', 'work', 'Other', 'Low', 'New'])
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    teardownTestDb()
+  })
+
+  /**
+   * BL-001: labels_add adds labels to tasks
+   */
+  test('BL-001: labels_add adds labels to multiple tasks', () => {
+    const task1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Task 1', labels: ['Work'] },
+    })
+    const task2 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Task 2', labels: ['Personal'] },
+    })
+
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task1.id, task2.id],
+      changes: { labels_add: ['Urgent'] } as BulkEditChanges,
+    })
+
+    expect(result.tasksAffected).toBe(2)
+
+    const updated1 = getTaskById(task1.id)!
+    const updated2 = getTaskById(task2.id)!
+
+    // Each task retains its existing labels and gets the new one
+    expect(updated1.labels).toEqual(['Work', 'Urgent'])
+    expect(updated2.labels).toEqual(['Personal', 'Urgent'])
+  })
+
+  /**
+   * BL-002: labels_add is case-insensitive (no duplicates)
+   */
+  test('BL-002: labels_add skips labels already present (case-insensitive)', () => {
+    const task = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Task', labels: ['Work', 'Personal'] },
+    })
+
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task.id],
+      changes: { labels_add: ['work', 'New'] } as BulkEditChanges,
+    })
+
+    // Only 'New' should be added since 'work' matches 'Work' case-insensitively
+    expect(result.tasksAffected).toBe(1)
+
+    const updated = getTaskById(task.id)!
+    expect(updated.labels).toEqual(['Work', 'Personal', 'New'])
+  })
+
+  /**
+   * BL-003: labels_remove removes matching labels (case-insensitive)
+   */
+  test('BL-003: labels_remove removes labels case-insensitively', () => {
+    const task1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Task 1', labels: ['Work', 'Personal', 'Urgent'] },
+    })
+    const task2 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Task 2', labels: ['work', 'Other'] },
+    })
+
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task1.id, task2.id],
+      changes: { labels_remove: ['Work'] } as BulkEditChanges,
+    })
+
+    expect(result.tasksAffected).toBe(2)
+
+    const updated1 = getTaskById(task1.id)!
+    const updated2 = getTaskById(task2.id)!
+
+    expect(updated1.labels).toEqual(['Personal', 'Urgent'])
+    expect(updated2.labels).toEqual(['Other']) // 'work' removed case-insensitively
+  })
+
+  /**
+   * BL-004: labels_add and labels_remove combined
+   */
+  test('BL-004: labels_add and labels_remove combined in single operation', () => {
+    const task = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Task', labels: ['Work', 'Low'] },
+    })
+
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task.id],
+      changes: { labels_add: ['Urgent'], labels_remove: ['Low'] } as BulkEditChanges,
+    })
+
+    expect(result.tasksAffected).toBe(1)
+
+    const updated = getTaskById(task.id)!
+    expect(updated.labels).toEqual(['Work', 'Urgent'])
+  })
+
+  /**
+   * BL-005: Full labels replacement takes precedence over labels_add/labels_remove
+   *
+   * When `labels` is provided alongside labels_add/labels_remove,
+   * the full replacement wins (labels_add/labels_remove are in an else-if branch).
+   */
+  test('BL-005: Full labels replacement takes precedence', () => {
+    const task = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Task', labels: ['Work', 'Personal'] },
+    })
+
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task.id],
+      changes: {
+        labels: ['New'],
+        labels_add: ['Extra'],
+      } as BulkEditChanges,
+    })
+
+    expect(result.tasksAffected).toBe(1)
+
+    const updated = getTaskById(task.id)!
+    // Full replacement wins - labels_add ignored
+    expect(updated.labels).toEqual(['New'])
+  })
+
+  /**
+   * BL-006: Proper undo snapshots for labels_add
+   */
+  test('BL-006: Undo restores original labels after labels_add', () => {
+    const task = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Task', labels: ['Work'] },
+    })
+
+    bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task.id],
+      changes: { labels_add: ['Urgent'] } as BulkEditChanges,
+    })
+
+    // Verify label was added
+    expect(getTaskById(task.id)!.labels).toEqual(['Work', 'Urgent'])
+
+    // Undo
+    expect(canUndo(TEST_USER_ID)).toBe(true)
+    const undoResult = executeUndo(TEST_USER_ID)
+    expect(undoResult).not.toBeNull()
+    expect(undoResult!.tasks_affected).toBe(1)
+
+    // Labels should be restored
+    expect(getTaskById(task.id)!.labels).toEqual(['Work'])
+  })
+
+  /**
+   * BL-007: No-op when adding labels already present on all tasks
+   */
+  test('BL-007: No-op when all labels already present', () => {
+    const task = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Task', labels: ['Work', 'Personal'] },
+    })
+
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [task.id],
+      changes: { labels_add: ['Work', 'Personal'] } as BulkEditChanges,
+    })
+
+    // No actual changes - tasksAffected should be 0
+    expect(result.tasksAffected).toBe(0)
+
+    // Labels unchanged
+    expect(getTaskById(task.id)!.labels).toEqual(['Work', 'Personal'])
+  })
+})
+
+/**
+ * Bulk Snooze Priority Filter Tests (SP-001 through SP-008)
+ *
+ * P0-P2 are always eligible. P3 (High) sits out a batch that still has
+ * something lower in it — these tests all do — and P4 (Urgent) is never
+ * bulk-snoozed at all. The High tier's own rule, and the two-press sequence it
+ * produces, are covered in "Bulk Snooze — the High tier" below.
+ */
+describe('Bulk Snooze Priority Filter', () => {
+  beforeEach(() => {
+    vi.setSystemTime(new Date('2026-01-15T16:00:00Z'))
+    setupTestDb()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    teardownTestDb()
+  })
+
+  /**
+   * SP-001: Mixed P0-P4 selection — P0-P2 snoozed, P3/P4 skipped
+   */
+  test('SP-001: Mixed selection — P0-P2 snoozed, P3/P4 skipped', () => {
+    const lowTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Low task', due_at: localTime(8, 0), priority: 1 },
+    })
+    const medTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Med task', due_at: localTime(9, 0), priority: 2 },
+    })
+    const highTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'High task', due_at: localTime(10, 0), priority: 3 },
+    })
+    const urgentTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent task', due_at: localTime(11, 0), priority: 4 },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [lowTask.id, medTask.id, highTask.id, urgentTask.id],
+      until: localTime(18, 0),
+    })
+
+    expect(result.tasksAffected).toBe(2)
+    expect(result.tasksSkipped).toBe(2)
+    expect(result.urgentSkipped).toBe(2)
+    // ...of which exactly one is High. `urgentSkipped` is the total.
+    expect(result.highSkipped).toBe(1)
+
+    // P1 and P2 were snoozed
+    expect(getTaskById(lowTask.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(medTask.id)!.due_at).toBe(localTime(18, 0))
+
+    // P3 and P4 were NOT snoozed
+    expect(getTaskById(highTask.id)!.due_at).toBe(localTime(10, 0))
+    expect(getTaskById(urgentTask.id)!.due_at).toBe(localTime(11, 0))
+  })
+
+  /**
+   * SP-002: All urgent selection — all skipped
+   */
+  test('SP-002: All urgent tasks are skipped', () => {
+    const urgent1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent 1', due_at: localTime(8, 0), priority: 4 },
+    })
+    const urgent2 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent 2', due_at: localTime(9, 0), priority: 4 },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [urgent1.id, urgent2.id],
+      until: localTime(18, 0),
+    })
+
+    expect(result.tasksAffected).toBe(0)
+    expect(result.tasksSkipped).toBe(2)
+    expect(result.urgentSkipped).toBe(2)
+
+    // Tasks were NOT snoozed
+    expect(getTaskById(urgent1.id)!.due_at).toBe(localTime(8, 0))
+    expect(getTaskById(urgent2.id)!.due_at).toBe(localTime(9, 0))
+  })
+
+  /**
+   * SP-003: P0/P1/P2 snoozed; P3 deferred because something lower is still eligible
+   */
+  test('SP-003: P0-P2 mix snoozed — P3 skipped', () => {
+    const unsetTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Unset task', due_at: localTime(8, 0) },
+    })
+    const lowTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Low task', due_at: localTime(9, 0), priority: 1 },
+    })
+    const medTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Med task', due_at: localTime(10, 0), priority: 2 },
+    })
+    const highTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'High task', due_at: localTime(10, 30), priority: 3 },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [unsetTask.id, lowTask.id, medTask.id, highTask.id],
+      until: localTime(18, 0),
+    })
+
+    expect(result.tasksAffected).toBe(3)
+    expect(result.tasksSkipped).toBe(1)
+    expect(result.urgentSkipped).toBe(1)
+
+    expect(getTaskById(unsetTask.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(lowTask.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(medTask.id)!.due_at).toBe(localTime(18, 0))
+
+    // P3 was NOT snoozed
+    expect(getTaskById(highTask.id)!.due_at).toBe(localTime(10, 30))
+  })
+
+  /**
+   * SP-004: Single urgent task — skipped
+   */
+  test('SP-004: Single urgent task is skipped from bulk snooze', () => {
+    const urgentTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent task', due_at: localTime(8, 0), priority: 4 },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [urgentTask.id],
+      until: localTime(18, 0),
+    })
+
+    expect(result.tasksAffected).toBe(0)
+    expect(result.tasksSkipped).toBe(1)
+    expect(result.urgentSkipped).toBe(1)
+
+    expect(getTaskById(urgentTask.id)!.due_at).toBe(localTime(8, 0))
+  })
+
+  /**
+   * SP-005: bulkEdit with due_at — P0-P2 snoozed, P3/P4 skipped
+   */
+  test('SP-005: bulkEdit with due_at applies priority filter — P2 snoozed, P3/P4 skipped', () => {
+    const medTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Med task', due_at: localTime(7, 0), priority: 2 },
+    })
+    const highTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'High task', due_at: localTime(8, 0), priority: 3 },
+    })
+    const urgentTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent task', due_at: localTime(9, 0), priority: 4 },
+    })
+
+    const newDueAt = localTime(18, 0, 1) // Tomorrow 6 PM
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [medTask.id, highTask.id, urgentTask.id],
+      changes: { due_at: newDueAt },
+    })
+
+    expect(result.tasksAffected).toBe(1)
+    expect(result.tasksSkipped).toBe(2)
+
+    // Med task was updated (P0-P2 eligible)
+    expect(getTaskById(medTask.id)!.due_at).toBe(newDueAt)
+
+    // High and Urgent tasks were NOT updated
+    expect(getTaskById(highTask.id)!.due_at).toBe(localTime(8, 0))
+    expect(getTaskById(urgentTask.id)!.due_at).toBe(localTime(9, 0))
+  })
+
+  /**
+   * SP-006: bulkEdit with non-snooze changes ignores priority filtering
+   */
+  test('SP-006: bulkEdit with non-snooze changes does not skip urgent', () => {
+    const lowTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Low task', due_at: localTime(8, 0), priority: 1 },
+    })
+    const urgentTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent task', due_at: localTime(9, 0), priority: 4 },
+    })
+
+    // Changing priority (not a snooze) — should NOT skip
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [lowTask.id, urgentTask.id],
+      changes: { priority: 2 },
+    })
+
+    expect(result.tasksAffected).toBe(2)
+    expect(result.tasksSkipped).toBe(0)
+
+    expect(getTaskById(lowTask.id)!.priority).toBe(2)
+    expect(getTaskById(urgentTask.id)!.priority).toBe(2)
+  })
+
+  /**
+   * SP-007: bulkEdit with due_at when all tasks are urgent — all skipped
+   */
+  test('SP-007: bulkEdit with due_at skips all-urgent selection', () => {
+    const urgent1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent 1', due_at: localTime(8, 0), priority: 4 },
+    })
+    const urgent2 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent 2', due_at: localTime(9, 0), priority: 4 },
+    })
+
+    const newDueAt = localTime(18, 0, 1) // Tomorrow 6 PM
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [urgent1.id, urgent2.id],
+      changes: { due_at: newDueAt },
+    })
+
+    expect(result.tasksAffected).toBe(0)
+    expect(result.tasksSkipped).toBe(2)
+
+    expect(getTaskById(urgent1.id)!.due_at).toBe(localTime(8, 0))
+    expect(getTaskById(urgent2.id)!.due_at).toBe(localTime(9, 0))
+  })
+
+  /**
+   * SP-008: bulkEdit with due_at + rrule bypasses priority filtering
+   */
+  test('SP-008: bulkEdit with due_at + rrule does not apply snooze protection', () => {
+    const lowTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Low task', due_at: localTime(8, 0), priority: 1 },
+    })
+    const urgentTask = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent task', due_at: localTime(9, 0), priority: 4 },
+    })
+
+    const result = bulkEdit({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [lowTask.id, urgentTask.id],
+      changes: {
+        due_at: localTime(18, 0, 1),
+        rrule: 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0',
+      },
+    })
+
+    // Since rrule is present, isSnoozeEdit=false, so all tasks proceed
+    expect(result.tasksAffected).toBe(2)
+    expect(result.tasksSkipped).toBe(0)
+  })
+})
+
+/**
+ * Bulk Snooze High/Urgent Exclusion Tests (BS-001 through BS-005)
+ *
+ * P3 (High) and P4 (Urgent) are excluded from bulk snooze. P0-P2 are all
+ * snoozed in a single pass — no tiers.
+ */
+describe('Bulk Snooze High/Urgent Exclusion', () => {
+  beforeEach(() => {
+    vi.setSystemTime(new Date('2026-01-15T16:00:00Z'))
+    setupTestDb()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    teardownTestDb()
+  })
+
+  /**
+   * BS-001: Full priority mix — P0-P2 all snoozed, P3/P4 excluded
+   */
+  test('BS-001: P0-P2 snoozed in single pass, P3/P4 excluded', () => {
+    const p0 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Unset', due_at: localTime(8, 0), priority: 0 },
+    })
+    const p1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Low', due_at: localTime(8, 30), priority: 1 },
+    })
+    const p2 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Medium', due_at: localTime(9, 0), priority: 2 },
+    })
+    const p3 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'High', due_at: localTime(9, 30), priority: 3 },
+    })
+    const p4 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent', due_at: localTime(10, 0), priority: 4 },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [p0.id, p1.id, p2.id, p3.id, p4.id],
+      until: localTime(18, 0),
+    })
+
+    expect(result.tasksAffected).toBe(3)
+    expect(result.tasksSkipped).toBe(2)
+    expect(result.urgentSkipped).toBe(2)
+
+    // P0-P2 all snoozed
+    expect(getTaskById(p0.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(p1.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(p2.id)!.due_at).toBe(localTime(18, 0))
+
+    // P3 and P4 untouched
+    expect(getTaskById(p3.id)!.due_at).toBe(localTime(9, 30))
+    expect(getTaskById(p4.id)!.due_at).toBe(localTime(10, 0))
+  })
+
+  /**
+   * BS-002: All P4 batch — nothing snoozed
+   */
+  test('BS-002: All P4 batch returns zero affected', () => {
+    const p4a = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent A', due_at: localTime(8, 0), priority: 4 },
+    })
+    const p4b = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent B', due_at: localTime(9, 0), priority: 4 },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [p4a.id, p4b.id],
+      until: localTime(18, 0),
+    })
+
+    expect(result.tasksAffected).toBe(0)
+    expect(result.urgentSkipped).toBe(2)
+  })
+
+  /**
+   * BS-003: P0-P2 only — all snoozed, zero skipped
+   */
+  test('BS-003: P0-P2 only batch — all snoozed', () => {
+    const p0 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'P0', due_at: localTime(8, 0), priority: 0 },
+    })
+    const p2 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'P2', due_at: localTime(9, 0), priority: 2 },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [p0.id, p2.id],
+      until: localTime(18, 0),
+    })
+
+    expect(result.tasksAffected).toBe(2)
+    expect(result.tasksSkipped).toBe(0)
+    expect(result.urgentSkipped).toBe(0)
+
+    expect(getTaskById(p0.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(p2.id)!.due_at).toBe(localTime(18, 0))
+  })
+
+  /**
+   * BS-004: urgentSkipped count accurate with multiple P4 tasks
+   */
+  test('BS-004: urgentSkipped count is accurate', () => {
+    const p1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'P1', due_at: localTime(8, 0), priority: 1 },
+    })
+    const p4a = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'P4a', due_at: localTime(9, 0), priority: 4 },
+    })
+    const p4b = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'P4b', due_at: localTime(10, 0), priority: 4 },
+    })
+    const p4c = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'P4c', due_at: localTime(11, 0), priority: 4 },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [p1.id, p4a.id, p4b.id, p4c.id],
+      until: localTime(18, 0),
+    })
+
+    expect(result.tasksAffected).toBe(1)
+    expect(result.urgentSkipped).toBe(3)
+  })
+
+  /**
+   * BS-005: Undo works correctly after simplified bulk snooze
+   */
+  test('BS-005: Undo restores all snoozed tasks', () => {
+    const p0 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'P0', due_at: localTime(8, 0), priority: 0 },
+    })
+    const p3 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'P3', due_at: localTime(9, 0), priority: 3 },
+    })
+    const p4 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'P4', due_at: localTime(10, 0), priority: 4 },
+    })
+
+    bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [p0.id, p3.id, p4.id],
+      until: localTime(18, 0),
+    })
+
+    // P0 snoozed, P3 and P4 untouched
+    expect(getTaskById(p0.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(p3.id)!.due_at).toBe(localTime(9, 0))
+    expect(getTaskById(p4.id)!.due_at).toBe(localTime(10, 0))
+
+    // Undo
+    expect(canUndo(TEST_USER_ID)).toBe(true)
+    executeUndo(TEST_USER_ID)
+
+    // P0 restored, P3 and P4 unchanged
+    expect(getTaskById(p0.id)!.due_at).toBe(localTime(8, 0))
+    expect(getTaskById(p3.id)!.due_at).toBe(localTime(9, 0))
+    expect(getTaskById(p4.id)!.due_at).toBe(localTime(10, 0))
+  })
+
+  /**
+   * BS-006: includeTaskIds bypasses P4 filter for the specified task only
+   *
+   * When pressing "All" from a P4 notification, that specific P4 task should
+   * be included in the bulk snooze while other P4 tasks remain excluded.
+   */
+  test('BS-006: includeTaskIds allows specific P4 task through filter', () => {
+    const p1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Low', due_at: localTime(8, 0), priority: 1 },
+    })
+    const p4included = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent (included)', due_at: localTime(9, 0), priority: 4 },
+    })
+    const p4excluded = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent (excluded)', due_at: localTime(10, 0), priority: 4 },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [p1.id, p4included.id, p4excluded.id],
+      until: localTime(18, 0),
+      includeTaskIds: [p4included.id],
+    })
+
+    // P1 and the included P4 are snoozed, the other P4 is skipped
+    expect(result.tasksAffected).toBe(2)
+    expect(result.urgentSkipped).toBe(1)
+
+    expect(getTaskById(p1.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(p4included.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(p4excluded.id)!.due_at).toBe(localTime(10, 0))
+  })
+
+  /**
+   * BS-007: includeTaskIds with undo — included P4 task is restored on undo
+   */
+  test('BS-007: undo restores included P4 task', () => {
+    const p1 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Low', due_at: localTime(8, 0), priority: 1 },
+    })
+    const p4 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Urgent', due_at: localTime(9, 0), priority: 4 },
+    })
+
+    bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [p1.id, p4.id],
+      until: localTime(18, 0),
+      includeTaskIds: [p4.id],
+    })
+
+    // Both snoozed
+    expect(getTaskById(p1.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(p4.id)!.due_at).toBe(localTime(18, 0))
+
+    // Undo restores both
+    expect(canUndo(TEST_USER_ID)).toBe(true)
+    executeUndo(TEST_USER_ID)
+
+    expect(getTaskById(p1.id)!.due_at).toBe(localTime(8, 0))
+    expect(getTaskById(p4.id)!.due_at).toBe(localTime(9, 0))
+  })
+
+  /**
+   * BS-008: includeTaskIds bypasses the filter for P3 (High), not just P4
+   *
+   * P3 joined the exclusion in v0.3. The bypass is what lets an explicit user
+   * selection — the mobile selection sheet, or "All" pressed from a High
+   * task's own notification — still snooze a task the sweep would skip. Left
+   * untested, a bypass that silently dropped High tasks would look identical
+   * to working code from the caller's side.
+   */
+  test('BS-008: includeTaskIds allows specific P3 task through filter', () => {
+    const p2 = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'Medium', due_at: localTime(8, 0), priority: 2 },
+    })
+    const p3included = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'High (included)', due_at: localTime(9, 0), priority: 3 },
+    })
+    const p3excluded = createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title: 'High (excluded)', due_at: localTime(10, 0), priority: 3 },
+    })
+
+    const result = bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: [p2.id, p3included.id, p3excluded.id],
+      until: localTime(18, 0),
+      includeTaskIds: [p3included.id],
+    })
+
+    expect(result.tasksAffected).toBe(2)
+    expect(result.urgentSkipped).toBe(1)
+
+    expect(getTaskById(p2.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(p3included.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(p3excluded.id)!.due_at).toBe(localTime(10, 0))
+  })
+})
+
+/**
+ * Bulk Snooze — the High tier (BH-001 through BH-006)
+ *
+ * P3 (High) is bulk-snoozable, but only when no LOWER-priority task in the same
+ * batch is still eligible (Trent, 2026-09-15). He had four overdue High tasks
+ * and one button, and the button reported "no snoozable tasks" — the sweep
+ * could not touch the only thing that was late.
+ *
+ * The behaviour these pin, in one line each:
+ *
+ * - Something lower in the batch defers the High tier (BH-001).
+ * - Nothing lower, so the High tier goes (BH-002).
+ * - A P4 in the batch does NOT count as "something lower" (BH-003) — if it did,
+ *   one Urgent task would defer the High tier forever and the second press
+ *   would never come.
+ * - P4 alone still moves nothing (BH-004).
+ * - The two-press sequence, end to end, on one unchanged batch (BH-005).
+ * - A rescued P4 is not "something lower" either (BH-006).
+ */
+describe('Bulk Snooze — the High tier', () => {
+  beforeEach(() => {
+    vi.setSystemTime(new Date('2026-01-15T16:00:00Z'))
+    setupTestDb()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    teardownTestDb()
+  })
+
+  const make = (title: string, priority: number, hour: number) =>
+    createTask({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      input: { title, due_at: localTime(hour, 0), priority },
+    })
+
+  const sweep = (ids: number[], hour: number, includeTaskIds?: number[]) =>
+    bulkSnooze({
+      userId: TEST_USER_ID,
+      userTimezone: TEST_TIMEZONE,
+      taskIds: ids,
+      until: localTime(hour, 0),
+      includeTaskIds,
+    })
+
+  test('BH-001: a mixed batch leaves the High tasks where they are', () => {
+    const p2 = make('Medium', 2, 8)
+    const highA = make('High A', 3, 9)
+    const highB = make('High B', 3, 10)
+
+    const result = sweep([p2.id, highA.id, highB.id], 18)
+
+    expect(result.tasksAffected).toBe(1)
+    expect(result.urgentSkipped).toBe(2)
+    expect(result.highSkipped).toBe(2)
+
+    expect(getTaskById(p2.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(highA.id)!.due_at).toBe(localTime(9, 0))
+    expect(getTaskById(highB.id)!.due_at).toBe(localTime(10, 0))
+  })
+
+  test('BH-002: a High-only batch is snoozed', () => {
+    const highA = make('High A', 3, 8)
+    const highB = make('High B', 3, 9)
+
+    const result = sweep([highA.id, highB.id], 18)
+
+    expect(result.tasksAffected).toBe(2)
+    expect(result.tasksSkipped).toBe(0)
+    expect(result.urgentSkipped).toBe(0)
+    expect(result.highSkipped).toBe(0)
+
+    expect(getTaskById(highA.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(highB.id)!.due_at).toBe(localTime(18, 0))
+  })
+
+  test('BH-003: a P4 in the batch does not defer the High tier', () => {
+    const high = make('High', 3, 8)
+    const urgent = make('Urgent', 4, 9)
+
+    const result = sweep([high.id, urgent.id], 18)
+
+    expect(result.tasksAffected).toBe(1)
+    expect(result.tasksSkipped).toBe(1)
+    // The one skip is the Urgent, and none of it is High.
+    expect(result.urgentSkipped).toBe(1)
+    expect(result.highSkipped).toBe(0)
+
+    expect(getTaskById(high.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(urgent.id)!.due_at).toBe(localTime(9, 0))
+  })
+
+  test('BH-004: a P4-only batch still snoozes nothing', () => {
+    const urgentA = make('Urgent A', 4, 8)
+    const urgentB = make('Urgent B', 4, 9)
+
+    const result = sweep([urgentA.id, urgentB.id], 18)
+
+    expect(result.tasksAffected).toBe(0)
+    expect(result.urgentSkipped).toBe(2)
+    expect(result.highSkipped).toBe(0)
+
+    expect(getTaskById(urgentA.id)!.due_at).toBe(localTime(8, 0))
+    expect(getTaskById(urgentB.id)!.due_at).toBe(localTime(9, 0))
+  })
+
+  /**
+   * The whole point of the rule, in sequence. The BATCH IS THE SAME BOTH TIMES
+   * — the caller does not learn anything between presses and does not filter
+   * anything out. The only thing that changes is that the P2 is no longer
+   * eligible after the first press, because a sweep sends the ids it was given
+   * and the second press is a second press of the same button.
+   */
+  test('BH-005: two presses — the first clears P0-P2, the second takes the High', () => {
+    // All three before the frozen clock's 10am, so all three are overdue.
+    const p1 = make('Low', 1, 7)
+    const p2 = make('Medium', 2, 8)
+    const high = make('High', 3, 9)
+
+    // First press: the whole day is overdue, so the batch is all three.
+    const first = sweep([p1.id, p2.id, high.id], 18)
+    expect(first.tasksAffected).toBe(2)
+    expect(first.highSkipped).toBe(1)
+    expect(getTaskById(high.id)!.due_at).toBe(localTime(9, 0))
+
+    // Second press: the sweep is over what is STILL overdue, which is the High
+    // alone — the two it just moved are in the future now.
+    const stillOverdue = [p1, p2, high]
+      .map((t) => getTaskById(t.id)!)
+      .filter((t) => new Date(t.due_at!) < new Date())
+      .map((t) => t.id)
+    expect(stillOverdue).toEqual([high.id])
+
+    const second = sweep(stillOverdue, 20)
+    expect(second.tasksAffected).toBe(1)
+    expect(second.urgentSkipped).toBe(0)
+    expect(getTaskById(high.id)!.due_at).toBe(localTime(20, 0))
+  })
+
+  test('BH-006: a rescued P4 does not defer the High tier either', () => {
+    const high = make('High', 3, 8)
+    const urgent = make('Urgent', 4, 9)
+
+    // `include_task_ids` rescues the Urgent; it must not also make the batch
+    // look like it has something lower still to sweep.
+    const result = sweep([high.id, urgent.id], 18, [urgent.id])
+
+    expect(result.tasksAffected).toBe(2)
+    expect(result.urgentSkipped).toBe(0)
+    expect(result.highSkipped).toBe(0)
+
+    expect(getTaskById(high.id)!.due_at).toBe(localTime(18, 0))
+    expect(getTaskById(urgent.id)!.due_at).toBe(localTime(18, 0))
+  })
+})
+
+/**
+ * BO-006..BO-009: bulk edit is held to the same quota/reminder invariants as
+ * the single PATCH. Both guards used to live only in `updateTask`, so a bulk
+ * edit could flag a quota as a reminder, or convert-and-snooze a dated task,
+ * with nothing stopping it. They now live in `collectFieldChanges`, which
+ * every edit path shares; a violating row refuses the whole batch.
+ */
+describe('Bulk Edit quota/reminder invariants', () => {
+  const base = { userId: TEST_USER_ID, userTimezone: TEST_TIMEZONE }
+
+  beforeEach(() => {
+    vi.setSystemTime(new Date('2026-01-15T16:00:00Z'))
+    setupTestDb()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    teardownTestDb()
+  })
+
+  test('BO-006: is_reminder on a quota refuses the whole batch', () => {
+    const quota = createTask({
+      ...base,
+      input: { title: 'Workouts', rrule: 'FREQ=WEEKLY', progress_target: 3 },
+    })
+    const plain = createTask({ ...base, input: { title: 'Plain' } })
+
+    expect(() =>
+      bulkEdit({ ...base, taskIds: [plain.id, quota.id], changes: { is_reminder: true } }),
+    ).toThrow(/both tracked .* and a reminder/)
+    expect(getTaskById(quota.id)!.is_reminder).toBe(false)
+    expect(getTaskById(plain.id)!.is_reminder).toBe(false)
+  })
+
+  test('BO-007: a flag-only (target 1) quota is refused too', () => {
+    const quota = createTask({
+      ...base,
+      input: { title: 'Date night', rrule: 'FREQ=MONTHLY', is_tracked: true },
+    })
+    expect(() =>
+      bulkEdit({ ...base, taskIds: [quota.id], changes: { is_reminder: true } }),
+    ).toThrow(/reminder/)
+    expect(getTaskById(quota.id)!.is_reminder).toBe(false)
+  })
+
+  test('BO-008: converting a dated task to a reminder and snoozing it at once is refused', () => {
+    const task = createTask({ ...base, input: { title: 'Dated', due_at: localTime(8, 0) } })
+
+    expect(() =>
+      bulkEdit({
+        ...base,
+        taskIds: [task.id],
+        changes: { is_reminder: true, due_at: localTime(18, 0) },
+      }),
+    ).toThrow(/Reminders cannot be deferred/)
+    const after = getTaskById(task.id)!
+    expect(after.is_reminder).toBe(false)
+    expect(after.due_at).toBe(localTime(8, 0))
+    expect(after.original_due_at).toBe(localTime(8, 0))
+  })
+
+  test('BO-009: moving reminders between periods still passes', () => {
+    // What the Reminders page's multi-edit sends: each reminder's new rule
+    // per task, no date.
+    const a = createTask({
+      ...base,
+      input: { title: 'Stretch', is_reminder: true, rrule: 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0' },
+    })
+    const b = createTask({
+      ...base,
+      input: { title: 'Water', is_reminder: true, rrule: 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' },
+    })
+
+    const result = bulkEdit({
+      ...base,
+      taskIds: [a.id, b.id],
+      changes: {},
+      perTask: {
+        [a.id]: { rrule: 'FREQ=DAILY;BYHOUR=19;BYMINUTE=0' },
+        [b.id]: { rrule: 'FREQ=DAILY;BYHOUR=20;BYMINUTE=0' },
+      },
+    })
+
+    expect(result.tasksAffected).toBe(2)
+    expect(getTaskById(a.id)!.rrule).toBe('FREQ=DAILY;BYHOUR=19;BYMINUTE=0')
+    expect(getTaskById(b.id)!.rrule).toBe('FREQ=DAILY;BYHOUR=20;BYMINUTE=0')
+    // A reminder's date follows its new schedule (it IS its occurrence).
+    expect(getTaskById(a.id)!.occurrence_at).toBe(getTaskById(a.id)!.due_at)
+  })
+})

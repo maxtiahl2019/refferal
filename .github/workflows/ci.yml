@@ -1,0 +1,332 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Native-only PRs (every changed file under ios/ or macos/) skip the web jobs.
+  # Docs-only PRs (every changed file a Markdown file, or native) keep Quality —
+  # format:check covers Markdown — but skip Test, Build, Integration and E2E,
+  # which no Markdown file can affect. The web jobs are required status checks
+  # on main; GitHub treats a job skipped by its `if:` as passing, so the PR
+  # stays mergeable. Pushes to main run everything but E2E (see the e2e job).
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      web: ${{ steps.filter.outputs.web }}
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "web=true" >> "$GITHUB_OUTPUT"; echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          files=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")
+          echo "$files"
+          # web: any file outside ios/ and macos/. code: any such file that is not Markdown.
+          # An empty diff runs everything.
+          nonnative=$(echo "$files" | grep -vE '^(ios|macos)/' || true)
+          if [ -n "$files" ] && [ -z "$nonnative" ]; then
+            echo "web=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "web=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$files" ] && ! echo "$nonnative" | grep -qvE '(^$|\.md$)'; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  quality:
+    name: Quality
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run type-check
+      - run: npm run lint
+      - run: npm run format:check
+
+  test:
+    name: Test
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm test
+
+  # The upgrade test (tests/upgrade/, `npm run test:upgrade`): this change's
+  # code opened on databases an OLDER release made — the previous release's
+  # schema.sql and the replayed production-shaped fixture — the path every
+  # deploy takes. Every other job builds its databases fresh, so none of them
+  # can see a migration that only breaks an existing database (prod, 10-24: a
+  # schema.sql index on a column only runMigrations adds). Full history, for
+  # `git show <base>:src/core/db/schema.sql`: on a PR the base is the PR's
+  # base commit, on a push to main the commit before it. ~1 s of tests.
+  upgrade:
+    name: Upgrade
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:upgrade
+        env:
+          UPGRADE_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || 'HEAD^1' }}
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [changes, quality]
+    if: needs.changes.outputs.code == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+      - run: npm ci
+      - uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('package-lock.json') }}-${{ hashFiles('src/**', 'app/**') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('package-lock.json') }}-
+            ${{ runner.os }}-nextjs-
+      - run: npm run build
+
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    needs: [changes, quality]
+    if: needs.changes.outputs.code == 'true'
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:integration
+
+  # E2E runs against a production build, made in this job by
+  # playwright.config.ts's webServer (`npm run build && next start`), with the
+  # same `.next/cache` the Build job restores so the build is incremental.
+  # Building here rather than downloading the Build job's output keeps E2E off
+  # Build's critical path: the build is ~40 s, about what an artifact
+  # upload + download of `.next` would cost, and this way E2E starts at once.
+  #
+  # It needs only `changes`, not `quality`: E2E is the long pole, and waiting
+  # ~80 s for lint first bought nothing but a later result.
+  #
+  # Sharded three ways (2026-10-21): one job ran ~15 min. Each shard is its
+  # own runner with its own build, server and freshly seeded database, so the
+  # one-worker, shared-database rule in playwright.config.ts holds inside each
+  # shard. The specs seed their own state, so a shard doesn't depend on specs
+  # that ran in another.
+  #
+  # Pull requests only. A PR's run already tests its merge with main (GitHub
+  # checks out refs/pull/N/merge), so running E2E again on the push to main
+  # repeated ~15 min of identical work. The rest of CI still runs on main.
+  e2e:
+    # No matrix value in the name: a job skipped by its `if:` never expands
+    # its matrix, and showed the raw expression as its check name. GitHub
+    # appends the value itself: "E2E shard (1)", "(2)", "(3)".
+    name: E2E shard
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true' && github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+      - run: npm ci
+      - uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('package-lock.json') }}-${{ hashFiles('src/**', 'app/**') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('package-lock.json') }}-
+            ${{ runner.os }}-nextjs-
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install chromium
+      # Not cached: this step is ~13 s, almost all of it `apt-get update`, which
+      # a cache of the .deb files can't skip (the runner image already carries
+      # Chrome's libraries, so little is actually downloaded).
+      - name: Install Playwright OS dependencies
+        run: npx playwright install-deps chromium
+      - run: npm run test:e2e -- --shard=${{ matrix.shard }}/3
+      # Flaky tests fail the run (`failOnFlakyTests` in playwright.config.ts);
+      # this names them, and the rest of the tally, on the run's summary page.
+      - name: E2E summary
+        if: always()
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          node <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          const fs = require('fs')
+          const file = 'test-results/e2e.json'
+          if (!fs.existsSync(file)) {
+            console.log(`### E2E shard ${process.env.SHARD}/3\n\nNo report: the run stopped before any test ran.`)
+            process.exit(0)
+          }
+          const report = JSON.parse(fs.readFileSync(file, 'utf8'))
+          const { expected, unexpected, flaky, skipped, duration } = report.stats
+          const byOutcome = { unexpected: [], flaky: [] }
+          const walk = (suite, path) => {
+            for (const spec of suite.specs ?? []) {
+              for (const t of spec.tests) {
+                if (byOutcome[t.status]) byOutcome[t.status].push(`${spec.file}:${spec.line} ${[...path, spec.title].join(' › ')}`)
+              }
+            }
+            for (const child of suite.suites ?? []) walk(child, [...path, child.title])
+          }
+          for (const s of report.suites) walk(s, [])
+          console.log(`### E2E shard ${process.env.SHARD}/3`)
+          console.log('')
+          console.log(`${expected} passed · ${unexpected} failed · **${flaky} flaky (counted as failures)** · ${skipped} skipped · ${Math.round(duration / 1000)} s`)
+          for (const [label, list] of [['Failed', byOutcome.unexpected], ['Flaky: passed only on retry', byOutcome.flaky]]) {
+            if (list.length === 0) continue
+            console.log(`\n**${label}**\n`)
+            for (const line of list) console.log(`- ${line}`)
+          }
+          EOF
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ matrix.shard }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 30
+
+  # WebKit (2026-10-26): the specs whose layout differs in Safari's engine —
+  # the engine the iOS and Mac apps run on. The dashboard row's title band
+  # (row-title-band.spec.ts) only ever showed in WebKit, so a Chromium-only
+  # suite could not catch it coming back. Only the specs listed here run; the
+  # project exists only with `E2E_WEBKIT=1` (playwright.config.ts). Whether
+  # the whole suite should run in WebKit is an open question (it would roughly
+  # double E2E time).
+  e2e-webkit:
+    name: E2E WebKit
+    # Pinned: this Playwright release has no WebKit build for ubuntu-latest
+    # (26.04 since late 2026) — "Playwright does not support webkit on
+    # ubuntu26.04-x64". Move with the next Playwright upgrade.
+    runs-on: ubuntu-24.04
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true' && github.event_name == 'pull_request'
+    env:
+      E2E_WEBKIT: '1'
+      WEBKIT_SPECS: tests/e2e/row-title-band.spec.ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+      - run: npm ci
+      - uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('package-lock.json') }}-${{ hashFiles('src/**', 'app/**') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('package-lock.json') }}-
+            ${{ runner.os }}-nextjs-
+      - name: Cache Playwright WebKit
+        id: playwright-webkit-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-webkit-${{ hashFiles('package-lock.json') }}
+      - name: Install Playwright WebKit
+        if: steps.playwright-webkit-cache.outputs.cache-hit != 'true'
+        run: npx playwright install webkit
+      - name: Install Playwright OS dependencies
+        run: npx playwright install-deps webkit
+      - run: npm run test:e2e -- $WEBKIT_SPECS --project=webkit
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-webkit
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 30
+
+  # The one "E2E" result the main-protection ruleset requires; the shards'
+  # names ("E2E shard (1)"…, "E2E WebKit") aren't in it. Passes when every shard passed, or
+  # when the shards were skipped because the PR has no code to test (docs or
+  # native only). `always()` makes it report even when a shard failed, since a
+  # job skipped by a failed dependency would count as passing.
+  e2e-result:
+    name: E2E
+    runs-on: ubuntu-latest
+    needs: [changes, e2e, e2e-webkit]
+    if: always() && github.event_name == 'pull_request'
+    steps:
+      - run: |
+          echo "changes=${{ needs.changes.result }} code=${{ needs.changes.outputs.code }} shards=${{ needs.e2e.result }} webkit=${{ needs.e2e-webkit.result }}"
+          [ "${{ needs.changes.result }}" = success ] || exit 1
+          [ "${{ needs.e2e.result }}" = success ] && [ "${{ needs.e2e-webkit.result }}" = success ] && exit 0
+          [ "${{ needs.e2e.result }}" = skipped ] && [ "${{ needs.e2e-webkit.result }}" = skipped ] && [ "${{ needs.changes.outputs.code }}" != true ] && exit 0
+          exit 1
+
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: moderate

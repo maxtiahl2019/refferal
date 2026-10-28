@@ -1,0 +1,60 @@
+/**
+ * Task progress API (REDESIGN-V03 §5)
+ *
+ * POST /api/tasks/:id/progress - Log progress on a tracked task (default +1)
+ *
+ * Deliberately separate from the completion endpoints. A sub-target increment
+ * is NOT a completion: it dispatches `task.progressed`, and the task stays open
+ * until its period boundary so overflow (3/2) remains observable.
+ */
+
+import { NextRequest } from 'next/server'
+import { requireAuth } from '@/core/auth'
+import { AppError } from '@/core/errors'
+import { success, badRequest, handleError, handleZodError, parseRouteId } from '@/lib/api-response'
+import { incrementProgress } from '@/core/tasks/progress'
+import { formatTaskResponse } from '@/lib/format-task'
+import { log } from '@/lib/logger'
+import { withLogging } from '@/lib/with-logging'
+import { z, ZodError } from 'zod'
+import type { RouteContext } from '@/types/api'
+import { progressSource } from '@/core/validation/quota-prompt'
+import { requestUndoId } from '@/core/request-context'
+
+const progressSchema = z.object({
+  /** Defaults to +1. Negative corrects a mis-log. */
+  delta: z.number().int().min(-100).max(100).default(1),
+  /** Where it was logged from (`progress_events.source`); `api` when absent. */
+  source: progressSource,
+})
+
+export const POST = withLogging(async function POST(request: NextRequest, context: RouteContext) {
+  try {
+    const user = await requireAuth(request)
+    const { id } = await context.params
+    const taskId = parseRouteId(id)
+    if (taskId === null) return badRequest('Invalid task ID')
+
+    // An empty body is the common case (a +1 tap), so tolerate no JSON at all.
+    const body = await request.json().catch(() => ({}))
+    const { delta, source } = progressSchema.parse(body)
+
+    const { task, met, description } = incrementProgress({
+      userId: user.id,
+      taskId,
+      delta,
+      source,
+    })
+
+    return success({
+      ...formatTaskResponse(task, user.timezone),
+      met,
+      description,
+      undo_id: requestUndoId(),
+    })
+  } catch (err) {
+    if (err instanceof ZodError) return handleZodError(err)
+    if (!(err instanceof AppError)) log.error('api', 'POST /api/tasks/:id/progress error:', err)
+    return handleError(err)
+  }
+})

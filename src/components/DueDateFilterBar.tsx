@@ -1,0 +1,237 @@
+'use client'
+
+import { OVERDUE_WORD } from '@/lib/task-model-words'
+import { useMemo } from 'react'
+import { Badge } from '@/components/ui/badge'
+import { cn } from '@/lib/utils'
+import { EXCLUDED_CHIP_CLASSES } from '@/lib/priority'
+import { getTimezoneDayBoundaries } from '@/lib/format-date'
+import { countChipDueBadges } from '@/lib/chip-due-badges'
+import { hasDebtDueDate, isOverdue } from '@/lib/task-counts'
+import { ChipDueBadges, describeChipDueBadges } from '@/components/ChipDueBadges'
+import { useChipInteraction, type ChipState } from '@/hooks/useChipInteraction'
+import type { Task } from '@/types'
+import { useDayStart } from '@/components/PreferencesProvider'
+
+export type DueDateFilter = 'overdue' | 'soon' | 'today' | 'this_week' | 'later' | 'no_due_date'
+
+interface DueDateFilterBarProps {
+  tasks: Task[]
+  selectedDateFilters: DueDateFilter[]
+  excludedDateFilters?: DueDateFilter[]
+  onToggleDateFilter: (filter: DueDateFilter) => void
+  timezone: string
+  onExclusiveDateFilter?: (filter: DueDateFilter) => void
+  onExcludeDateFilter?: (filter: DueDateFilter) => void
+  /** Chips shown elsewhere instead — FilterBar pins Overdue in its control row. */
+  omitFilters?: DueDateFilter[]
+  /** The dashboard's clock (`useDashboardNow`) — the chips' counts move with it. */
+  now: Date
+}
+
+const FILTER_LABELS: Record<DueDateFilter, string> = {
+  overdue: OVERDUE_WORD,
+  soon: 'Soon',
+  today: 'Today',
+  this_week: 'This Week',
+  later: 'Later',
+  // The filter key keeps its API name; the label is the task model's word.
+  no_due_date: 'No Target',
+}
+
+const FILTER_ORDER: DueDateFilter[] = [
+  'overdue',
+  'soon',
+  'today',
+  'this_week',
+  'later',
+  'no_due_date',
+]
+
+/**
+ * Classify a task into one or more due date filter buckets.
+ * Tasks are classified along two independent axes:
+ * - Time urgency (at most one): overdue, soon
+ * - Calendar period (at most one): today, this_week, later
+ * A task can appear in both a time-urgency and calendar-period bucket
+ * (e.g., a task due today at 9 AM when it's now 3 PM is both "overdue" and "today").
+ *
+ * "Overdue" and "has a due date" come from `isOverdue`/`hasDebtDueDate` in
+ * `@/lib/task-counts` — the same predicates the top bar's red/gray pills count
+ * with — so the Overdue chip and the red pill share one definition. A quota
+ * (tracked) row therefore lands in "No Due Date" here, matching `countTasks`,
+ * which never counts it as overdue or due today. The dashboard already strips
+ * quotas before this runs; the guard only matters for a legacy row.
+ */
+export function classifyTaskDueDate(
+  task: Task,
+  now: Date,
+  boundaries: ReturnType<typeof getTimezoneDayBoundaries>,
+): DueDateFilter[] {
+  if (!hasDebtDueDate(task)) return ['no_due_date']
+
+  const due = new Date(task.due_at)
+  const soonBoundary = new Date(now.getTime() + 2 * 60 * 60 * 1000)
+  const buckets: DueDateFilter[] = []
+
+  // Time urgency (at most one)
+  if (isOverdue(task, now)) buckets.push('overdue')
+  else if (due < soonBoundary) buckets.push('soon')
+
+  // Calendar period (at most one)
+  if (due >= boundaries.todayStart && due < boundaries.tomorrowStart) buckets.push('today')
+  else if (due >= boundaries.tomorrowStart && due < boundaries.nextWeekStart)
+    buckets.push('this_week')
+  else if (due >= boundaries.nextWeekStart) buckets.push('later')
+
+  return buckets
+}
+
+/**
+ * Renders due date filter badges inline (no wrapper).
+ * Parent component handles layout and clear button.
+ * Uses square badges (rounded-sm) to visually distinguish from pill-shaped label badges.
+ *
+ * Supports single-click toggle, double-click exclude, Cmd/Ctrl+click exclusive select,
+ * and mobile long-press (400ms, 10px jitter) for exclusive select.
+ */
+export function DueDateFilterBar({
+  tasks,
+  selectedDateFilters,
+  excludedDateFilters = [],
+  onToggleDateFilter,
+  timezone,
+  onExclusiveDateFilter,
+  onExcludeDateFilter,
+  omitFilters,
+  now,
+}: DueDateFilterBarProps) {
+  const dayStart = useDayStart()
+  const { filterCounts, todayOverdueCount } = useMemo(() => {
+    const boundaries = getTimezoneDayBoundaries(timezone, dayStart, now)
+    const counts = new Map<DueDateFilter, number>()
+    const todaysTasks: Task[] = []
+
+    for (const task of tasks) {
+      const buckets = classifyTaskDueDate(task, now, boundaries)
+      for (const bucket of buckets) {
+        counts.set(bucket, (counts.get(bucket) || 0) + 1)
+      }
+      if (buckets.includes('today')) todaysTasks.push(task)
+    }
+
+    // Include any filter that has tasks OR is actively selected/excluded
+    const filterCounts = FILTER_ORDER.filter((f) => !omitFilters?.includes(f))
+      .filter(
+        (f) => counts.has(f) || selectedDateFilters.includes(f) || excludedDateFilters.includes(f),
+      )
+      .map((f) => [f, counts.get(f) ?? 0] as [DueDateFilter, number])
+
+    // The Today chip's own overdue pill (feat/chip-due-badges): how many of
+    // ITS total (the 'today' bucket above) are also overdue, NOT the
+    // corpus-wide overdue count — that's the separate "Overdue" chip.
+    // Reuses the same overdue split the project chips use rather than a
+    // bespoke comparison here.
+    const todayOverdueCount = countChipDueBadges(todaysTasks, now, boundaries).overdue
+
+    return { filterCounts, todayOverdueCount }
+  }, [tasks, timezone, dayStart, now, selectedDateFilters, excludedDateFilters, omitFilters])
+
+  const hasActiveFilter = selectedDateFilters.length > 0 || excludedDateFilters.length > 0
+  if (filterCounts.length <= 1 && !hasActiveFilter) return null
+
+  return (
+    <>
+      {filterCounts.map(([filter, count]) => {
+        const chipState: ChipState = excludedDateFilters.includes(filter)
+          ? 'excluded'
+          : selectedDateFilters.includes(filter)
+            ? 'included'
+            : 'unselected'
+        return (
+          <DateChipBadge
+            key={filter}
+            filter={filter}
+            label={FILTER_LABELS[filter]}
+            count={count}
+            chipState={chipState}
+            // Only the Today chip gets an overdue pill — the others
+            // (Overdue, Soon, This Week...) keep their plain total.
+            overdueCount={filter === 'today' ? todayOverdueCount : 0}
+            onToggle={onToggleDateFilter}
+            onExclusive={onExclusiveDateFilter}
+            onExclude={onExcludeDateFilter}
+          />
+        )
+      })}
+    </>
+  )
+}
+
+function DateChipBadge({
+  filter,
+  label,
+  count,
+  chipState,
+  overdueCount,
+  onToggle,
+  onExclusive,
+  onExclude,
+}: {
+  filter: DueDateFilter
+  label: string
+  count: number
+  chipState: ChipState
+  /** Today chip only (feat/chip-due-badges) — 0 for every other date filter. */
+  overdueCount: number
+  onToggle: (filter: DueDateFilter) => void
+  onExclusive?: (filter: DueDateFilter) => void
+  onExclude?: (filter: DueDateFilter) => void
+}) {
+  const handlers = useChipInteraction({
+    chipKey: filter,
+    chipState,
+    onToggle,
+    onExclusive,
+    onExclude,
+  })
+  const showBadge = filter === 'today' && chipState !== 'excluded'
+  // No `totalLabel`: the Today chip's total already means "due today" (unlike
+  // a project chip's total, which is every open task), so the accessible
+  // name doesn't repeat it as a separate "due today" clause.
+  const accessibleLabel = showBadge
+    ? describeChipDueBadges({
+        name: label,
+        total: count,
+        totalLabel: null,
+        dueToday: 0,
+        overdue: overdueCount,
+      })
+    : undefined
+
+  return (
+    <Badge
+      variant="outline"
+      data-date-chip={filter}
+      title={accessibleLabel}
+      aria-label={accessibleLabel}
+      className={cn(
+        'relative flex-shrink-0 cursor-pointer rounded-sm transition-colors select-none',
+        chipState === 'excluded'
+          ? EXCLUDED_CHIP_CLASSES
+          : chipState === 'included'
+            ? 'bg-foreground text-background border-foreground hover:bg-foreground/90'
+            : 'hover:bg-muted',
+      )}
+      onClick={handlers.onClick}
+      onPointerDown={handlers.onPointerDown}
+      onPointerUp={handlers.onPointerUp}
+      onPointerMove={handlers.onPointerMove}
+      onPointerLeave={handlers.onPointerLeave}
+    >
+      <span className="relative leading-none">{label}</span>
+      <span className="relative ml-1 text-[10px] leading-none opacity-60">{count}</span>
+      {showBadge && <ChipDueBadges dueToday={0} overdue={overdueCount} showDueToday={false} />}
+    </Badge>
+  )
+}

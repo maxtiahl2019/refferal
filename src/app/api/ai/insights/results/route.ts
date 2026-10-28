@@ -1,0 +1,71 @@
+/**
+ * SHELVED (2026-10-22): Insights (this route answers 410 FEATURE_SHELVED) is shelved behind `OPENTASK_AI_UNSHELVE`
+ * (src/core/ai/shelved.ts) until it is redesigned. The code stays in place,
+ * dormant — do not "fix" or re-enable it without Trent.
+ */
+/**
+ * GET /api/ai/insights/results — Get cached AI insights results
+ *
+ * Returns all insights results for the authenticated user, sorted by score desc.
+ * Includes signal_counts for filter chip rendering.
+ */
+
+import { NextRequest } from 'next/server'
+import { requireAuth, AuthError } from '@/core/auth'
+import {
+  getInsightsResults,
+  getActiveInsightsSession,
+  getLastInsightsDurationMs,
+  getLastInsightsUnscoredCount,
+  INSIGHTS_SIGNALS,
+} from '@/core/ai'
+import { success, unauthorized, handleError, featureShelved } from '@/lib/api-response'
+import { log } from '@/lib/logger'
+import { withLogging } from '@/lib/with-logging'
+import { shelvedAiFeaturesOn } from '@/core/ai/shelved'
+
+export const GET = withLogging(async function GET(request: NextRequest) {
+  try {
+    const user = await requireAuth(request)
+
+    // SHELVED (2026-10-22): src/core/ai/shelved.ts. After auth (a bad token
+    // is still a 401), before the AI-enabled check.
+    if (!shelvedAiFeaturesOn()) return featureShelved()
+
+    const { results, generatedAt, signalCounts } = getInsightsResults(user.id)
+    const activeSession = getActiveInsightsSession(user.id)
+    const durationMs = getLastInsightsDurationMs(user.id)
+
+    // Insights are stale if generated_at is not today (UTC), matching What's Next behavior
+    const todayUtc = new Date().toISOString().split('T')[0]
+    const stale = results.length > 0 && (!generatedAt || generatedAt.split('T')[0] !== todayUtc)
+
+    return success({
+      results,
+      generated_at: generatedAt,
+      stale,
+      duration_ms: durationMs,
+      unscored_tasks: getLastInsightsUnscoredCount(user.id),
+      signal_counts: signalCounts,
+      signals: INSIGHTS_SIGNALS.map((s) => ({
+        key: s.key,
+        label: s.label,
+        color: s.color,
+        icon: s.icon,
+        description: s.description,
+      })),
+      active_session: activeSession
+        ? {
+            session_id: activeSession.id,
+            completed: activeSession.completed,
+            total_tasks: activeSession.total_tasks,
+            started_at: activeSession.started_at,
+          }
+        : null,
+    })
+  } catch (err) {
+    if (err instanceof AuthError) return unauthorized(err.message)
+    log.error('api', 'GET /api/ai/insights/results error:', err)
+    return handleError(err)
+  }
+})

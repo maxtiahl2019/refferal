@@ -1,0 +1,329 @@
+import AppKit
+import UserNotifications
+import WidgetKit
+
+/// APNs registration, notification permission, and notification action handling.
+///
+/// The macOS counterpart of `ios/OpenTask/AppDelegate.swift`. The notification
+/// categories and the action semantics are shared code
+/// (`ios/Shared/NotificationConstants.swift`), so Done / +1hr / All +1hr /
+/// Complete all mean exactly what they mean on the phone and the watch.
+///
+/// Three deliberate differences from the iPhone app, each explained at its
+/// call site below: no `dismissAllNotifications()` on activation, a narrower
+/// rule for suppressing foreground banners, and no `.criticalAlert` in the
+/// authorization request.
+final class MacAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // This app and the code it shares with the iPhone app diagnose
+        // themselves with `print()`, and on macOS stdout is a pipe, not a
+        // console — so those lines sit in a 4 KB buffer until the process
+        // exits, which for a GUI app means "never, in practice". Line
+        // buffering makes them appear as they happen when the app is launched
+        // from a terminal, which is how anyone debugs it (see macos/README.md).
+        setvbuf(stdout, nil, _IOLBF, 0)
+
+        // Re-save Keychain items with kSecAttrAccessibleAfterFirstUnlock so a
+        // notification action fired before the first unlock can still read the
+        // token. Harmless when they are already correct.
+        KeychainHelper.migrateAccessibility(keys: ["serverURL", "bearerToken"])
+
+        UNUserNotificationCenter.current().delegate = self
+        registerNotificationCategories()
+        requestNotificationPermission()
+
+        // Refresh the cached time slots (fire-and-forget) so the slot-snooze
+        // notification actions catch up to any change made elsewhere, without
+        // blocking the initial (cache-only) category registration above on a
+        // network round trip.
+        Task { await refreshSlotActions() }
+
+        // The menu bar item: its overdue list (first fetch, then its own
+        // polling) and the status item that shows it.
+        Task { @MainActor in
+            MenuBarModel.shared.start()
+            StatusItemController.shared.start()
+        }
+
+        print("[OpenTask] Launched — configured: \(AppConfig.shared.isConfigured), "
+            + "server: \(AppConfig.shared.serverURL.isEmpty ? "(none)" : AppConfig.shared.serverURL), "
+            + "token in Keychain: \(KeychainHelper.read(key: "bearerToken") != nil)")
+
+        // Worth a line in the log every launch: "notifications don't work" has
+        // three unrelated causes (permission, entitlement, server-side device
+        // registration) and this rules the first one in or out immediately.
+        Task {
+            let settings = await UNUserNotificationCenter.current().notificationSettings()
+            print("[OpenTask] Notification authorization: \(settings.authorizationStatus.rawValue) "
+                + "(0=notDetermined 1=denied 2=authorized 3=provisional)")
+        }
+    }
+
+    /// A notification client with no window is still doing its job, so closing
+    /// the window must not quit the app — it parks it in the Dock, and a
+    /// notification tap or a Dock click brings it back.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    /// Dock click with every window closed: SwiftUI restores the `Window`
+    /// scene, and returning true is what asks it to.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !hasVisibleWindows {
+            WebViewManager.shared.showWindow()
+        }
+        return true
+    }
+
+    /// Clear this Mac's delivered notifications when the app comes forward —
+    /// the user is looking at the list, so the banners have served their
+    /// purpose.
+    ///
+    /// Unlike the iPhone app this does NOT call
+    /// `APIClient.dismissAllNotifications()`. That endpoint clears delivered
+    /// notifications on every OTHER device too, and on a Mac "became active"
+    /// fires every time the user clicks back into the window — it would wipe
+    /// the phone's notifications dozens of times a day. (The same call is
+    /// already flagged as a bug on iOS in the 2026-09-15 feasibility notes;
+    /// this app simply does not inherit it.)
+    /// Leaving the app refreshes the desktop widgets, so whatever was just
+    /// changed in the window shows on the desktop without waiting for the
+    /// timeline or a widget push (Trent, 2026-09-23).
+    func applicationWillResignActive(_ notification: Notification) {
+        WidgetCenter.shared.reloadAllTimelines()
+        // Same reason for the menu bar item's list.
+        Task { @MainActor in await MenuBarModel.shared.refresh() }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+        // The Dock badge is set from the server's overdue count, not zeroed
+        // (2026-09-29): zeroing it on every click into the window hid overdue
+        // tasks until the next push. Same as the iPhone app — see
+        // `refreshBadgeFromServer()`.
+        Task { await refreshBadgeFromServer() }
+
+        // Refresh the slot-snooze action list on every foreground too, not
+        // just launch — slots are user-configurable and this app can stay
+        // backgrounded (or just parked, since closing the window doesn't
+        // quit it) for a long time.
+        Task { await refreshSlotActions() }
+
+        // Tell the page to refresh. Clicking back into a window that was only
+        // covered by other windows leaves the WKWebView `visible`, so the
+        // page gets no visibilitychange, and window `focus` is not reliably
+        // delivered to it either — so a change made on another device while
+        // the page's sync stream was dead stayed on screen until a reload.
+        // `useSyncStream` listens for this event, refreshes everything the
+        // page shows and re-opens the stream if it has closed (deduped
+        // against its own focus/visibility triggers). No-op before the web
+        // view exists.
+        WebViewManager.shared.evaluate("window.dispatchEvent(new CustomEvent('opentask-app-active'))")
+
+        // Mirrors ios/OpenTask/OpenTaskApp.swift's scenePhase == .active case:
+        // reloads triggered by the app foregrounding don't count against the
+        // widget refresh budget, so OpenTaskMacWidgets is current again by the
+        // time the user glances at it — without this, a task completed or
+        // logged in the window would leave the widget showing stale data for
+        // up to 30 minutes (the unprompted-refresh budget interval).
+        WidgetCenter.shared.reloadAllTimelines()
+    }
+
+    // MARK: - Permission and registration
+
+    /// No `.criticalAlert`: that option needs a per-App-ID entitlement Apple
+    /// grants by request, and asking for it here would fail provisioning for a
+    /// capability this app does not use.
+    private func requestNotificationPermission() {
+        Task { @MainActor in
+            do {
+                let granted = try await UNUserNotificationCenter.current()
+                    .requestAuthorization(options: [.alert, .badge, .sound])
+                print("[OpenTask] Notification permission granted: \(granted)")
+                guard granted else { return }
+                NSApplication.shared.registerForRemoteNotifications()
+            } catch {
+                print("[OpenTask] Notification permission error: \(error)")
+            }
+        }
+    }
+
+    func application(
+        _ application: NSApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        let token = deviceToken.map { String(format: "%02.2hhx", $0) }.joined()
+        print("[OpenTask] APNs registered, token length \(token.count)")
+        #if DEBUG
+        print("[OpenTask] APNs token: \(token)")
+        #endif
+
+        AppConfig.shared.deviceToken = token
+
+        // Hand the token to a page that may already be loaded. The web app
+        // registers it with the server under the session cookie, so push
+        // follows the logged-in user rather than the Bearer token's owner.
+        // The CustomEvent wakes PreferencesProvider if it mounted first.
+        Task { @MainActor in
+            WebViewManager.shared.evaluate(
+                WebBridge.deviceInfoJS(token: token)
+                    + "window.dispatchEvent(new CustomEvent('opentask-device-token'));"
+            )
+        }
+    }
+
+    /// The expected failure while this app ships without `aps-environment`:
+    /// "no valid aps-environment entitlement string found". Everything else in
+    /// the app keeps working; only push is dead. See `macos/README.md`.
+    func application(
+        _ application: NSApplication,
+        didFailToRegisterForRemoteNotificationsWithError error: Error
+    ) {
+        print("[OpenTask] APNs registration failed: \(error.localizedDescription)")
+    }
+
+    // MARK: - Silent push
+
+    /// Server-initiated housekeeping: badge counts and dismissals when a task
+    /// is handled somewhere else. macOS hands these to a running app with no
+    /// completion handler — there is no background-fetch contract to satisfy.
+    func application(_ application: NSApplication, didReceiveRemoteNotification userInfo: [String: Any]) {
+        guard let type = userInfo["type"] as? String else { return }
+        let center = UNUserNotificationCenter.current()
+
+        // Every one of these means a task changed somewhere — the menu bar
+        // item's badge and list should catch up now, not at the next poll.
+        Task { @MainActor in await MenuBarModel.shared.refresh() }
+
+        switch type {
+        // Legacy: servers before 2026-09-29 sent the badge as a silent push.
+        // Current servers send an alert-type push with only `aps.badge`,
+        // which macOS applies to the Dock tile itself.
+        case "badge-update":
+            if let badge = userInfo["badge"] as? Int {
+                updateBadge(badge)
+                print("[OpenTask] Badge updated to \(badge)")
+            }
+
+        case "dismiss-all":
+            center.removeAllDeliveredNotifications()
+            print("[OpenTask] Dismiss-all: cleared all delivered notifications")
+
+        case "dismiss":
+            guard let taskIds = userInfo["taskIds"] as? [Int], !taskIds.isEmpty else { return }
+            // With `promptKeys`, a quota-prompt banner closes only by its key.
+            let promptKeys = userInfo[QuotaNagKey.dismissPromptKeys] as? [String]
+            Task {
+                let removed = await removeDeliveredNotifications(forTaskIds: taskIds, promptKeys: promptKeys)
+                if removed > 0 {
+                    print("[OpenTask] Dismissed \(removed) notifications for tasks \(taskIds)")
+                }
+            }
+
+        default:
+            break
+        }
+    }
+
+    // MARK: - Notification actions
+
+    /// Same three categories as the phone: a summary (bulk only), a §6 time
+    /// slot (no taskId — the slot is the unit), and an individual task. The
+    /// server call and the banner removal are `NotificationActionRunner`,
+    /// shared with the phone, the Watch and the content extension; this keeps
+    /// the Mac's part — opening the dashboard or the task on a body tap, and
+    /// re-reading the Dock badge after a summary or task action (even a failed
+    /// one), not after a slot action or a task push with no `taskId`.
+    ///
+    /// The custom-snooze actions are not registered on any category here: they
+    /// are served by a notification content extension, and this app does not
+    /// have one yet. If one is added later, it calls the runner with its
+    /// picked time, as the phone's does.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let userInfo = response.notification.request.content.userInfo
+        let categoryId = response.notification.request.content.categoryIdentifier
+
+        if let type = userInfo["type"] as? String, type == "dismiss" {
+            completionHandler()
+            return
+        }
+
+        Task {
+            var outcome: NotificationActionRunner.Outcome?
+            do {
+                let result = try await NotificationActionRunner.handle(response)
+                outcome = result
+                switch result {
+                case .openDashboard:
+                    // The dashboard, not /reminders, for a slot push too: it
+                    // can arrive on a build older than the web /reminders
+                    // route, and the dashboard is never a 404.
+                    await WebViewManager.shared.navigate(path: "/")
+                case .openTask(let taskId):
+                    await WebViewManager.shared.navigateToTask(taskId)
+                case .openDeadlines:
+                    // The deadlines nag: the Tasks card on the deadlines page.
+                    await WebViewManager.shared.navigate(path: DeepLinkRouter.notificationDeadlinesPath)
+                case .openPrompt(let promptKey):
+                    // A quota-prompt push: its row on /reminders.
+                    await WebViewManager.shared.navigate(path: PromptDeepLink.webPath(promptKey: promptKey))
+                case .promptDid:
+                    // The desktop widgets show the count: rebuild them from
+                    // the server (the app has no WidgetStore to write through;
+                    // macOS app reloads are free, ios/AGENTS.md § Widgets).
+                    WidgetCenter.shared.reloadAllTimelines()
+                case .promptDidStale(let promptKey):
+                    // Nothing was logged: say so, as the web does.
+                    postLocalNotice(
+                        NotificationActionRunner.staleDidMessage, identifier: "prompt-stale-\(promptKey)"
+                    )
+                default:
+                    break
+                }
+            } catch {
+                print("[OpenTask] Notification action error (\(categoryId)): \(error)")
+            }
+            // A quota is never in the badge, so its push skips the refresh,
+            // as a slot's does.
+            if categoryId != NotificationCategory.slotReminder,
+               categoryId != NotificationCategory.quotaNag,
+               outcome != .missingTaskId {
+                await refreshBadgeFromServer()
+            }
+            completionHandler()
+        }
+    }
+
+    /// The iPhone suppresses every notification while the app is foreground —
+    /// on a phone, "app open" means the task list is the only thing on screen.
+    /// That is not true of a Mac: an OpenTask window can be open and active
+    /// behind three others, or on another Space entirely. So the banner is
+    /// suppressed only when the app is active AND has a window actually on
+    /// screen; otherwise it is delivered, because the user is demonstrably
+    /// looking at something else.
+    ///
+    /// `.badge` is in both answers: while the app is running, macOS applies a
+    /// push's `aps.badge` to the Dock tile only if this handler asks for it,
+    /// and the server's badge-only push is how the Dock learns the overdue
+    /// count changed. That push has no title or body, so it is never offered
+    /// a banner (an empty one would be worse than none).
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        let content = notification.request.content
+        let badgeOnly = content.title.isEmpty && content.body.isEmpty
+        let hasVisibleWindow = NSApp.windows.contains { $0.isVisible && !$0.isMiniaturized }
+        if badgeOnly || (NSApp.isActive && hasVisibleWindow) {
+            completionHandler([.badge])
+        } else {
+            completionHandler([.banner, .list, .sound, .badge])
+        }
+    }
+}

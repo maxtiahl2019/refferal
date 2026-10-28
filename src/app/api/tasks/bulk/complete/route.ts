@@ -1,0 +1,60 @@
+/**
+ * Batch complete API (REDESIGN-V03 §6.1)
+ *
+ * POST /api/tasks/bulk/complete - Complete N tasks in ONE request
+ *
+ * Built for the notification batch-checklist: the content extension stages
+ * check-marks in SwiftUI and commits them with a single action button. No such
+ * endpoint existed — the extension would otherwise have to fire N requests from
+ * a context that can be suspended mid-flight, which is exactly how you get a
+ * half-applied checklist and a user who stops trusting the notification.
+ *
+ * Delegates to bulkDone(), so this is one transaction and ONE undo entry: an
+ * accidental commit is a single undo away, not N.
+ */
+
+import { NextRequest } from 'next/server'
+import { requireAuth, AuthError } from '@/core/auth'
+import { success, unauthorized, handleError, handleZodError } from '@/lib/api-response'
+import { bulkDone } from '@/core/tasks'
+import { validateBulkComplete } from '@/core/validation'
+import { log } from '@/lib/logger'
+import { withLogging } from '@/lib/with-logging'
+import { ZodError } from 'zod'
+import { requestUndoId } from '@/core/request-context'
+
+export const POST = withLogging(async function POST(request: NextRequest) {
+  try {
+    const user = await requireAuth(request)
+    const input = validateBulkComplete(await request.json())
+
+    // Quota reminders (2026-09-24): `prompts` rides the same transaction and
+    // undo entry — `{ key, did }` per prompt (a bare key string = consider).
+    // `ids` may be empty when `prompts` is not. Bare quota ids are still
+    // skipped, and refused when nothing else is in the batch.
+    const result = bulkDone({
+      userId: user.id,
+      userTimezone: user.timezone,
+      taskIds: input.ids,
+      closePeriod: input.close_period === true,
+      prompts: input.prompts,
+      source: input.source,
+    })
+
+    return success({
+      tasks_affected: result.tasksAffected,
+      recurring_count: result.recurringCount,
+      series_ended_count: result.seriesEndedCount,
+      one_off_count: result.oneOffCount,
+      quota_skipped: result.quotaSkipped,
+      prompts_considered: result.promptsConsidered,
+      prompts_did: result.promptsDid,
+      undo_id: requestUndoId(),
+    })
+  } catch (err) {
+    if (err instanceof AuthError) return unauthorized(err.message)
+    if (err instanceof ZodError) return handleZodError(err)
+    log.error('api', 'POST /api/tasks/bulk/complete error:', err)
+    return handleError(err)
+  }
+})

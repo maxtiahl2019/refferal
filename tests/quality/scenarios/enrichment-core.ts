@@ -1,0 +1,831 @@
+/**
+ * Core enrichment scenarios — updated from original scenarios.ts
+ *
+ * These test fundamental enrichment capabilities: title cleaning, date extraction,
+ * priority inference, recurrence, auto-snooze, recurrence mode, notes,
+ * wall-of-text decomposition, "critical" keyword handling, and complex combinations.
+ *
+ * Labels policy: labels must be empty unless the user explicitly requests one.
+ */
+
+import type { AITestScenario } from '../types'
+
+export const enrichmentCoreScenarios: AITestScenario[] = [
+  {
+    id: 'enrich-simple-clean',
+    feature: 'enrichment',
+    description: 'Simple, clean input — should extract minimal fields',
+    input: {
+      text: 'Buy milk',
+      timezone: 'America/Chicago',
+      projects: [
+        { id: 1, name: 'Inbox', shared: false },
+        { id: 2, name: 'Shopping List', shared: true },
+      ],
+    },
+    requirements: {
+      must_include: {
+        priority: 0,
+        rrule: null,
+        labels: [],
+      },
+      must_not_include: {
+        priority: 4,
+      },
+      quality_notes:
+        'Title should be unchanged or minimally cleaned. ' +
+        'project_name should be null — no explicit project assignment in input. ' +
+        'Labels must be an empty array — no explicit label request in input. ' +
+        'No due date or recurrence should be inferred.',
+    },
+  },
+  {
+    id: 'enrich-date-relative',
+    feature: 'enrichment',
+    description: 'Relative date extraction — "tomorrow morning"',
+    input: {
+      text: 'call the dentist tomorrow morning',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      // A part of day is a target, never on deck (A5, 2026-10-20).
+      must_include: {
+        rrule: null,
+        labels: [],
+        due_at: '~notnull',
+        on_deck_day: null,
+      },
+      quality_notes:
+        'Title should be clean (e.g., "Call the dentist"). ' +
+        'due_at should be tomorrow morning in local time (e.g., T09:00:00, no Z suffix). ' +
+        '"Morning" typically means 8-10am local. ' +
+        'Labels must be an empty array — no explicit label request in input. Priority should be 0 (no urgency signal).',
+    },
+  },
+  {
+    id: 'enrich-garbled-dictation',
+    feature: 'enrichment',
+    description: 'Garbled dictation with filler words — clean up while preserving intent',
+    input: {
+      text: 'um I need to like go get the car you know fixed or whatever maybe next week',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        rrule: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title should be cleaned of dictation artifacts (um, like, you know, or whatever). ' +
+        'Something like "Get the car fixed" or "Go get the car fixed". ' +
+        '"maybe next week" names a window, not a day (task model 2026-10-10): horizon weeks with due_at null is preferred; a due_at next week is acceptable. ' +
+        'Labels must be an empty array — no explicit label request in input. Priority 0 or 1.',
+    },
+  },
+  {
+    id: 'enrich-priority-urgent',
+    feature: 'enrichment',
+    description: 'Explicit urgent priority signal (lowercase for dictation realism)',
+    input: {
+      text: 'urgent fix the leak in the kitchen right now',
+      timezone: 'America/Chicago',
+      projects: [
+        { id: 1, name: 'Inbox', shared: false },
+        { id: 3, name: 'Home', shared: false },
+      ],
+    },
+    requirements: {
+      must_include: {
+        priority: 4,
+        due_at: '~soon',
+        rrule: null,
+        labels: [],
+      },
+      quality_notes:
+        'Priority MUST be 4 (urgent). ' +
+        'Title should remove "urgent" and "right now" (extracted into priority/date). ' +
+        'Something like "Fix the leak in the kitchen". ' +
+        'due_at: "right now" is soon today (2026-10-16) — about 15 minutes after the run time, rounded up to the next quarter hour. ' +
+        'project_name should be null — no explicit project assignment. Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+  {
+    id: 'enrich-recurrence-daily',
+    feature: 'enrichment',
+    description: 'Daily recurrence with time — "every morning at 8am"',
+    input: {
+      text: 'take vitamins every morning at 8am',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Take vitamins" (recurrence phrase removed). ' +
+        'rrule MUST be "FREQ=DAILY" (no DTSTART). ' +
+        'due_at should be 8:00 AM local (e.g., T08:00:00, no Z suffix). ' +
+        'Labels must be an empty array — no explicit label request in input. Priority 0.',
+    },
+  },
+  {
+    id: 'enrich-multi-field',
+    feature: 'enrichment',
+    description: 'Multiple fields extracted at once — priority, date, project',
+    input: {
+      text: 'high priority call mom next tuesday, add it to family',
+      timezone: 'America/Chicago',
+      projects: [
+        { id: 1, name: 'Inbox', shared: false },
+        { id: 4, name: 'Family', shared: false },
+      ],
+    },
+    requirements: {
+      must_include: {
+        rrule: null,
+        labels: [],
+        due_at: null,
+        on_deck_day: '~notnull',
+      },
+      quality_notes:
+        'Priority should be 3 (high). ' +
+        'Title: "Call mom" (priority/date/project phrases removed). ' +
+        '"next tuesday" is a day with no time: on_deck_day next Tuesday, due_at null (on deck). ' +
+        'project_name should be "Family". ' +
+        'Labels must be an empty array — "add it to family" is a project assignment, not a label request.',
+    },
+  },
+  {
+    id: 'enrich-already-clean',
+    feature: 'enrichment',
+    description: 'Already clean input — should not over-extract',
+    input: {
+      text: 'Fix the door hinge',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        priority: 0,
+        rrule: null,
+        project_name: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title should be unchanged: "Fix the door hinge". ' +
+        'No date, priority, recurrence, or project should be inferred. ' +
+        'Labels must be an empty array — no explicit label request in input. ' +
+        'This tests the "do not over-extract" principle.',
+    },
+  },
+  {
+    id: 'enrich-shopping-context',
+    feature: 'enrichment',
+    description: 'Shopping item with Shopping List project available — no explicit assignment',
+    input: {
+      text: 'whole milk',
+      timezone: 'America/Chicago',
+      projects: [
+        { id: 1, name: 'Inbox', shared: false },
+        { id: 2, name: 'Shopping List', shared: true },
+      ],
+    },
+    requirements: {
+      must_include: {
+        priority: 0,
+        project_name: null,
+        rrule: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title should be "Whole milk" or unchanged. ' +
+        'project_name MUST be null — Shopping List project exists but the user did not assign it and the text does not contain its name. ' +
+        'Content-based project inference is forbidden. ' +
+        'Labels must be an empty array — no explicit label request in input. ' +
+        'No date or priority should be inferred.',
+    },
+  },
+  {
+    id: 'enrich-emotional-cue',
+    feature: 'enrichment',
+    description: 'Emotional urgency — should infer some priority from language cues',
+    input: {
+      text: 'I really really need to remember to call the insurance company this is killing me',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        rrule: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title should be cleaned: "Call the insurance company" or similar. ' +
+        'Priority should be >= 2 (the emotional intensity "really really", "killing me" signals importance). ' +
+        'No date should be inferred (no temporal signal). ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+  {
+    id: 'enrich-no-over-infer',
+    feature: 'enrichment',
+    description: 'Ambiguous task — should not over-infer fields',
+    input: {
+      text: 'check the mail',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        priority: 0,
+        rrule: null,
+        project_name: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title should be "Check the mail" or unchanged. ' +
+        'Priority must be 0 — no urgency signal. ' +
+        'No due date should be inferred. ' +
+        'Labels must be an empty array — no explicit label request in input. ' +
+        'This tests conservative extraction — better to leave empty than guess wrong.',
+    },
+  },
+
+  // -------------------------------------------------------------------------
+  // Wall-of-Text Decomposition — dense dictation with reference info
+  // -------------------------------------------------------------------------
+
+  {
+    id: 'enrich-wall-medical-appointment',
+    feature: 'enrichment',
+    description: 'Dense medical appointment with address, phone, and prep instructions',
+    input: {
+      text: 'doctor patel appointment at 4200 medical parkway suite 310 his number is 512-555-0847 um its next Thursday at 2:30 pm and I need to bring my insurance card and the MRI results and they said to fast for 4 hours before',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        priority: 0,
+        rrule: null,
+        auto_snooze_minutes: null,
+        recurrence_mode: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title should be clean: "Doctor Patel appointment" or similar. ' +
+        'due_at should be next Thursday at 2:30 PM local (e.g., T14:30:00, no Z suffix). ' +
+        'notes MUST preserve: address (4200 Medical Parkway Suite 310), ' +
+        'phone (512-555-0847), what to bring (insurance card, MRI results), ' +
+        'and fasting instructions (fast 4 hours before). ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+  {
+    id: 'enrich-wall-contractor-quote',
+    feature: 'enrichment',
+    description: 'Contractor quote with dollar amount, phone, and expiration deadline',
+    input: {
+      text: 'so ABC plumbing gave me a quote for forty eight hundred dollars for the water heater replacement their number is 847-555-0192 and the quote expires at the end of the month I would say medium priority',
+      timezone: 'America/Chicago',
+      projects: [
+        { id: 1, name: 'Inbox', shared: false },
+        { id: 3, name: 'Home', shared: false },
+      ],
+    },
+    requirements: {
+      must_include: {
+        priority: 2,
+        rrule: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title should be something like "ABC Plumbing water heater replacement" or similar. ' +
+        'Priority must be 2 (explicit "medium priority"). ' +
+        'due_at should be end of the current month. ' +
+        'notes MUST preserve: quote amount ($4,800), phone (847-555-0192). ' +
+        'Labels must be an empty array — no explicit label request in input. ' +
+        'project_name should be null — no explicit project assignment.',
+    },
+  },
+  {
+    id: 'enrich-wall-travel-booking',
+    feature: 'enrichment',
+    description: 'Travel booking with multiple confirmation numbers and details',
+    input: {
+      text: 'ok so I got the flight booked Southwest flight ABC123 confirmation number 2847 leaving Saturday at 6:15 am from Midway then I have a Hertz rental car and the Marriott confirmation is H-99281',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        rrule: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title should capture the core action: something about travel/flight or trip prep. ' +
+        'due_at should be Saturday at 6:15 AM local (e.g., T06:15:00, no Z suffix). ' +
+        'notes MUST preserve ALL confirmation numbers and details: ' +
+        'Southwest flight ABC123, confirmation 2847, Midway departure, ' +
+        'Hertz rental, Marriott confirmation H-99281. ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+  {
+    id: 'enrich-wall-legal-deadline',
+    feature: 'enrichment',
+    description: 'Legal deadline with case number, dollar amounts, and phone with extension',
+    input: {
+      text: 'I need to file the property tax appeal case number 2026-PT-44821 the deadline is February 28th the county appraised it at 285 thousand but the assessment is 340 thousand the county phone is 312-555-0400 extension 247',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        rrule: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title: "File property tax appeal" or similar. ' +
+        'Priority: 0 is acceptable (no explicit keyword), but >= 1 would also be reasonable given the legal deadline. ' +
+        'deadline_at should be February 28th, end of day ("the deadline is" is a stated cutoff); due_at null. ' +
+        'notes MUST preserve: case number (2026-PT-44821), dollar amounts ($285k vs $340k), ' +
+        'phone with extension (312-555-0400 ext 247). ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+
+  // -------------------------------------------------------------------------
+  // Auto-Snooze Variations
+  // -------------------------------------------------------------------------
+
+  {
+    id: 'enrich-autosnooze-explicit',
+    feature: 'enrichment',
+    description: 'Explicit auto-snooze in minutes',
+    input: {
+      text: 'check on the laundry auto-snooze 30 minutes',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        auto_snooze_minutes: 30,
+        priority: 0,
+        rrule: null,
+        notes: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Check on the laundry" (auto-snooze phrase removed). ' +
+        'auto_snooze_minutes must be exactly 30. ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+  {
+    id: 'enrich-autosnooze-hours',
+    feature: 'enrichment',
+    description: 'Auto-snooze specified in hours — must convert to minutes',
+    input: {
+      text: 'take the dog out every 4 hours snooze every 2 hours starts at 7am',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        auto_snooze_minutes: 120,
+        recurrence_mode: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Take the dog out" or similar. ' +
+        'auto_snooze_minutes must be 120 (2 hours converted to minutes). ' +
+        'rrule should be null — sub-daily recurrence uses auto_snooze_minutes: 240, not rrule. ' +
+        'due_at should be 7:00 AM local (e.g., T07:00:00, no Z suffix). ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+  {
+    id: 'enrich-autosnooze-off',
+    feature: 'enrichment',
+    description: 'Explicitly disabled auto-snooze — must be 0, not null',
+    input: {
+      text: 'weekly standup every Monday 9am no auto-snooze high priority',
+      timezone: 'America/Chicago',
+      projects: [
+        { id: 1, name: 'Inbox', shared: false },
+        { id: 5, name: 'Work', shared: false },
+      ],
+    },
+    requirements: {
+      must_include: {
+        auto_snooze_minutes: 0,
+        priority: 3,
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Weekly standup" (recurrence/priority/snooze phrases removed). ' +
+        'auto_snooze_minutes must be exactly 0 (explicitly disabled, not null). ' +
+        'priority must be 3 (high). ' +
+        'rrule should be FREQ=WEEKLY;BYDAY=MO. ' +
+        'Labels must be an empty array — no explicit label request in input. ' +
+        'project_name should be null — no explicit project assignment.',
+    },
+  },
+
+  // -------------------------------------------------------------------------
+  // Recurrence Mode
+  // -------------------------------------------------------------------------
+
+  {
+    id: 'enrich-recurrence-from-completion',
+    feature: 'enrichment',
+    description: 'Explicit from-completion signal — "start counting from when I actually do it"',
+    input: {
+      text: 'clean the fish tank every 2 weeks but start counting from when I actually do it',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        recurrence_mode: 'from_completion',
+        auto_snooze_minutes: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Clean the fish tank" (recurrence phrase removed). ' +
+        'recurrence_mode MUST be "from_completion" — "start counting from when I actually do it" is an explicit signal. ' +
+        'rrule should be FREQ=WEEKLY;INTERVAL=2 or FREQ=DAILY;INTERVAL=14. ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+  {
+    id: 'enrich-recurrence-after-finish',
+    feature: 'enrichment',
+    description: 'From-completion + auto-snooze combination — "after I finish it"',
+    input: {
+      text: 'mow the lawn every 10 days after I finish it auto-snooze 4 hours',
+      timezone: 'America/Chicago',
+      projects: [
+        { id: 1, name: 'Inbox', shared: false },
+        { id: 3, name: 'Home', shared: false },
+      ],
+    },
+    requirements: {
+      must_include: {
+        recurrence_mode: 'from_completion',
+        auto_snooze_minutes: 240,
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Mow the lawn" (recurrence/snooze phrases removed). ' +
+        'recurrence_mode MUST be "from_completion" — "after I finish it" is explicit. ' +
+        'auto_snooze_minutes must be 240 (4 hours). ' +
+        'rrule should reflect 10-day interval. ' +
+        'Labels must be an empty array — no explicit label request in input. ' +
+        'project_name should be null — no explicit project assignment.',
+    },
+  },
+  {
+    id: 'enrich-recurrence-no-mode',
+    feature: 'enrichment',
+    description: 'Standard recurrence — no from-completion signal, mode should be null',
+    input: {
+      text: 'pay rent on the 1st of every month',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        recurrence_mode: null,
+        priority: 0,
+        auto_snooze_minutes: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Pay rent" (recurrence phrase removed). ' +
+        'recurrence_mode MUST be null — no from-completion signal present. ' +
+        'rrule should be FREQ=MONTHLY;BYMONTHDAY=1. ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+
+  // -------------------------------------------------------------------------
+  // "Critical" keyword — maps to P4 priority, not a label
+  // -------------------------------------------------------------------------
+
+  {
+    id: 'enrich-critical-explicit',
+    feature: 'enrichment',
+    description: 'Explicit "critical alert" — maps to P4 priority, no label',
+    input: {
+      text: "pick up Ellie's EpiPen before Friday critical alert",
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        priority: 4,
+        labels: [],
+        auto_snooze_minutes: null,
+      },
+      quality_notes:
+        'Title: "Pick up Ellie\'s EpiPen" or similar (date/alert phrase removed). ' +
+        'Priority MUST be 4 — "critical" is a P4 keyword. ' +
+        'Labels must be empty — "critical" is not a label, it maps to priority. ' +
+        'deadline_at should be Friday, or end of Thursday ("before Friday" is a cutoff either way); due_at null preferred.',
+    },
+  },
+  {
+    id: 'enrich-critical-false-positive',
+    feature: 'enrichment',
+    description: 'Emotional urgency without "critical"/"urgent" keyword — must NOT trigger P4',
+    input: {
+      text: 'really really important submit the quarterly report by Wednesday end of day',
+      timezone: 'America/Chicago',
+      projects: [
+        { id: 1, name: 'Inbox', shared: false },
+        { id: 5, name: 'Work', shared: false },
+      ],
+    },
+    requirements: {
+      must_include: {
+        labels: [],
+      },
+      must_not_include: {
+        priority: 0,
+      },
+      quality_notes:
+        'Title: "Submit the quarterly report" or similar (urgency phrase removed). ' +
+        'Labels should be an empty array — no explicit label request in input. ' +
+        'Priority should be 2-3 (importance signal without "urgent"/"critical" keyword — NOT 4). ' +
+        'deadline_at should be Wednesday end of day (23:59, or 17:00 read as business end of day is acceptable); due_at null' +
+        ' (task model 2026-10-10: "by X" is a cutoff, not a day to do it). ' +
+        'project_name should be null — no explicit project assignment.',
+    },
+  },
+  {
+    id: 'enrich-critical-non-alert-context',
+    feature: 'enrichment',
+    description: 'Word "critical" in non-urgency context — must NOT trigger P4 priority',
+    input: {
+      text: 'read the critical thinking chapter for philosophy class by Monday',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        priority: 0,
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Read the critical thinking chapter" or similar. ' +
+        'Priority MUST be 0 — "critical thinking" is an academic concept, not an urgency signal. ' +
+        'Labels must be an empty array — no explicit label request in input. ' +
+        'deadline_at should be Monday, end of day; due_at null' +
+        ' (task model 2026-10-10: "by X" is a cutoff, not a day to do it).',
+    },
+  },
+
+  // -------------------------------------------------------------------------
+  // Complex Combinations
+  // -------------------------------------------------------------------------
+
+  {
+    id: 'enrich-combo-wall-snooze-recurrence',
+    feature: 'enrichment',
+    description: 'Wall-of-text + auto-snooze + from-completion recurrence',
+    input: {
+      text: "flush the water heater it's an AO Smith GCR-50 model need to do this every 3 months from the last time I actually did it auto-snooze 2 hours and there are specific steps you gotta close the cold water valve first then connect a hose to the drain valve",
+      timezone: 'America/Chicago',
+      projects: [
+        { id: 1, name: 'Inbox', shared: false },
+        { id: 3, name: 'Home', shared: false },
+      ],
+    },
+    requirements: {
+      must_include: {
+        auto_snooze_minutes: 120,
+        recurrence_mode: 'from_completion',
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Flush the water heater" or similar. ' +
+        'auto_snooze_minutes must be 120 (2 hours). ' +
+        'recurrence_mode MUST be "from_completion" — "from the last time I actually did it". ' +
+        'rrule should reflect 3-month interval. ' +
+        'notes MUST preserve: model (AO Smith GCR-50), instructions. ' +
+        'Labels must be an empty array — no explicit label request in input. ' +
+        'project_name should be null — no explicit project assignment.',
+    },
+  },
+  {
+    id: 'enrich-combo-critical-urgent-date',
+    feature: 'enrichment',
+    description: 'Urgent + critical + time-sensitive — all high-signal fields at once',
+    input: {
+      text: "urgent critical alert refill mom's heart medication prescription number RX-7742190 Walgreens on Main closes at 9pm tonight",
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        priority: 4,
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Refill mom\'s heart medication" or similar (urgency/alert phrases removed). ' +
+        'Priority MUST be 4 (explicit "urgent" and "critical"). ' +
+        'Labels must be empty — no explicit label request in input. ' +
+        'The pharmacy closing at 9pm tonight is a cutoff: deadline_at tonight at 9:00 PM local (T21:00:00, no Z suffix) is preferred. A due_at tonight at or before 9:00 PM instead is acceptable; anything after 9 PM is wrong. ' +
+        'notes MUST preserve: Rx number (RX-7742190), Walgreens location (on Main).',
+    },
+  },
+  {
+    id: 'enrich-combo-full-dictation',
+    feature: 'enrichment',
+    description:
+      'Garbled dictation exercising every new field — priority, project, recurrence, mode, snooze, meta',
+    input: {
+      text: 'um ok so like the payroll reconciliation needs to happen every two weeks on Friday and uh start counting from when I complete it high priority it goes in the Work project oh and auto-snooze every hour and my ADP login is in the shared drive under HR folder',
+      timezone: 'America/Chicago',
+      projects: [
+        { id: 1, name: 'Inbox', shared: false },
+        { id: 5, name: 'Work', shared: false },
+      ],
+    },
+    requirements: {
+      must_include: {
+        priority: 3,
+        auto_snooze_minutes: 60,
+        recurrence_mode: 'from_completion',
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Payroll reconciliation" (dictation artifacts and metadata removed). ' +
+        'Priority must be 3 (explicit "high priority"). ' +
+        'auto_snooze_minutes must be 60 (1 hour). ' +
+        'recurrence_mode MUST be "from_completion". ' +
+        'rrule should be biweekly Friday. project_name should be "Work". ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+  {
+    id: 'enrich-combo-garbled-multi-signal',
+    feature: 'enrichment',
+    description: 'Garbled input with form reference, vague priority, project match',
+    input: {
+      text: 'HOA meeting is next Wednesday at 7 pm I need to bring that noise complaint form B-12 its kinda important add it to Home',
+      timezone: 'America/Chicago',
+      projects: [
+        { id: 1, name: 'Inbox', shared: false },
+        { id: 3, name: 'Home', shared: false },
+      ],
+    },
+    requirements: {
+      must_include: {
+        rrule: null,
+        auto_snooze_minutes: null,
+        labels: [],
+      },
+      must_not_include: {
+        priority: 4,
+      },
+      quality_notes:
+        'Title: "HOA meeting" or similar. ' +
+        'due_at should be next Wednesday at 7:00 PM local (e.g., T19:00:00, no Z suffix). ' +
+        'priority should be 1-2 ("kinda important" is a mild signal, not urgent). ' +
+        'project_name should be "Home". ' +
+        'notes should preserve: form reference (noise complaint form B-12). ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+
+  // -------------------------------------------------------------------------
+  // Edge Cases
+  // -------------------------------------------------------------------------
+
+  {
+    id: 'enrich-edge-autosnooze-no-recurrence',
+    feature: 'enrichment',
+    description: 'Auto-snooze on a non-recurring task — snooze without rrule',
+    input: {
+      text: 'call the cable company about the bill auto-snooze every hour tomorrow afternoon',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        auto_snooze_minutes: 60,
+        rrule: null,
+        recurrence_mode: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Call the cable company about the bill" or similar. ' +
+        'auto_snooze_minutes must be 60 (1 hour). ' +
+        'rrule MUST be null — "every hour" is auto-snooze, not recurrence. ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+  {
+    id: 'enrich-edge-recurrence-mode-no-rrule',
+    feature: 'enrichment',
+    description: 'From-completion intent without explicit recurrence interval',
+    input: {
+      text: 'deep clean the oven and when I do it remind me to do it again from when I finish',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        priority: 0,
+        auto_snooze_minutes: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Deep clean the oven" or similar. ' +
+        'The user signals from-completion intent ("from when I finish") but gives no interval. ' +
+        'Acceptable outcomes: recurrence_mode="from_completion" with a reasonable default rrule, ' +
+        'OR the from-completion intent captured in notes so it is not lost. ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+  {
+    id: 'enrich-edge-meta-notes-minimal',
+    feature: 'enrichment',
+    description: 'Simple task with nothing extra — notes must be null',
+    input: {
+      text: 'buy new socks tomorrow',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        notes: null,
+        priority: 0,
+        rrule: null,
+        auto_snooze_minutes: null,
+        labels: [],
+        due_at: null,
+        on_deck_day: '~notnull',
+      },
+      quality_notes:
+        'Title: "Buy new socks" (date phrase removed). ' +
+        'notes MUST be null — there is no extra context to capture. ' +
+        '"tomorrow" with no time → on_deck_day tomorrow, due_at null (on deck). ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+
+  // -------------------------------------------------------------------------
+  // Time-of-Day Resolution
+  // -------------------------------------------------------------------------
+
+  {
+    id: 'enrich-time-tomorrow-evening',
+    feature: 'enrichment',
+    description: 'Time-of-day: "tomorrow evening" should resolve to evening hours',
+    input: {
+      text: 'remind me about this tomorrow evening',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        priority: 0,
+        rrule: null,
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Remind me about this" or similar. ' +
+        'due_at should be tomorrow evening in local time — typically 5-8 PM (e.g., T17:00:00 to T20:00:00, no Z suffix). ' +
+        'The AI has time-of-day guidance: "evening" should use judgment, typically early evening. ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+  {
+    id: 'enrich-time-before-bed',
+    feature: 'enrichment',
+    description: 'Time-of-day: "before bed" should resolve to user sleep time (10 PM default)',
+    input: {
+      text: 'take vitamins before bed every night',
+      timezone: 'America/Chicago',
+      projects: [{ id: 1, name: 'Inbox', shared: false }],
+    },
+    requirements: {
+      must_include: {
+        labels: [],
+      },
+      quality_notes:
+        'Title: "Take vitamins" or similar. ' +
+        'rrule should be FREQ=DAILY. ' +
+        'due_at should use the sleep time (10:00 PM / 22:00 local by default, e.g., T22:00:00, no Z suffix). ' +
+        'The AI has guidance: "before bed" / "bedtime" → sleep time (10:00 PM). ' +
+        'Labels must be an empty array — no explicit label request in input.',
+    },
+  },
+]

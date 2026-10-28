@@ -1,0 +1,64 @@
+/**
+ * Bulk Edit API route
+ *
+ * POST /api/tasks/bulk/edit - Edit multiple tasks
+ *
+ * Body: { ids: [1, 2, 3, ...], changes: { priority: 3, ... }, per_task?: { "1": { rrule } },
+ *         include_task_ids?: [...], delta_minutes?: 60, date_task_ids?: [...] }
+ */
+
+import { NextRequest } from 'next/server'
+import { getAuthUser, AuthError } from '@/core/auth'
+import { success, unauthorized, handleError, handleZodError } from '@/lib/api-response'
+import { bulkEdit } from '@/core/tasks'
+import { validateBulkEdit } from '@/core/validation'
+import { log } from '@/lib/logger'
+import { ZodError } from 'zod'
+import { withLogging } from '@/lib/with-logging'
+import { notifyDemoEngagement } from '@/lib/demo-notify'
+
+export const POST = withLogging(async function POST(request: NextRequest) {
+  try {
+    const user = await getAuthUser(request)
+    if (!user) {
+      return unauthorized()
+    }
+
+    const body = await request.json()
+    const input = validateBulkEdit(body)
+
+    const result = bulkEdit({
+      userId: user.id,
+      userTimezone: user.timezone,
+      taskIds: input.ids,
+      changes: input.changes,
+      perTask: input.per_task,
+      includeTaskIds: input.include_task_ids,
+      deltaMinutes: input.delta_minutes,
+      dateTaskIds: input.date_task_ids,
+      // `allow_past_deadline_ids` / `cap_at_deadline_ids`: accepted, ignored
+      // (2026-10-12) — every move stops at its deadline (§8.2).
+    })
+
+    notifyDemoEngagement(user.name, 'update')
+    return success({
+      tasks_affected: result.tasksAffected,
+      tasks_skipped: result.tasksSkipped,
+      skipped_no_due_date: result.noDueDateSkipped,
+      // Dates withheld because a passed deadline holds the task to the High
+      // tier (2026-10-12) / stopped at a deadline still ahead (§8.2). Other
+      // fields applied either way.
+      skipped_deadline: result.deadlineSkipped,
+      capped_deadline: result.deadlineCapped,
+    })
+  } catch (err) {
+    if (err instanceof AuthError) {
+      return unauthorized(err.message)
+    }
+    if (err instanceof ZodError) {
+      return handleZodError(err)
+    }
+    log.error('api', 'POST /api/tasks/bulk/edit error:', err)
+    return handleError(err)
+  }
+})

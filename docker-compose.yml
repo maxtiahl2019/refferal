@@ -1,0 +1,23 @@
+services:
+  opentask:
+    image: ghcr.io/trentmcnitt/opentask:latest
+    # To build from source instead:
+    # build: .
+    ports:
+      - '3000:3000'
+    volumes:
+      - ./data:/app/data
+    env_file: .env
+    healthcheck:
+      test:
+        ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:3000/api/health']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    environment:
+      # Validates AUTH_SECRET is set in .env (fails fast with a clear message)
+      - AUTH_SECRET=${AUTH_SECRET:?Set AUTH_SECRET in .env -- generate with openssl rand -base64 32}
+      # Docker-specific database path (do not change unless you modify the volume mount)
+      - OPENTASK_DB_PATH=/app/data/tasks.db
+    restart: unless-stopped

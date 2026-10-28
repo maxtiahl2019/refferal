@@ -1,0 +1,1736 @@
+/**
+ * Track on the web (REDESIGN-V03 §5): a tracked task's row is a progress row —
+ * count, bar, +1 and −1 — and reaching the target reads as "met" without
+ * closing the task.
+ */
+import { test, expect, waitForPreferenceSave, showAllNow } from './fixtures'
+import { request as apiRequest, type Page, type Response } from '@playwright/test'
+
+/**
+ * Tasks made by the running test, deleted by the `afterEach` below — and
+ * deliberately NOT by a `finally` inside the test body.
+ *
+ * A body-level `finally` shares the test's own timeout. When the body times
+ * out that budget is already spent, so the cleanup's first API call rejects
+ * immediately and every row it was meant to remove survives into the retry.
+ * Playwright gives hooks a separate budget once the test function has
+ * finished, so an `afterEach` still runs. This is not a tolerance: it is the
+ * difference between a cleanup that runs and one that provably cannot.
+ *
+ * What the old shape cost (2026-09-21): the quota-range test below timed out
+ * on a slow CI runner, leaked its two probe quotas into the shared E2E
+ * database, and both retries then failed on the leftovers rather than on the
+ * thing under test — four red CI runs whose retries were never diagnostic.
+ */
+const madeByThisTest: number[] = []
+function cleanUpLater(...ids: number[]): void {
+  madeByThisTest.push(...ids)
+}
+
+async function createTask(page: Page, body: Record<string, unknown>): Promise<number> {
+  const res = await page.request.post('/api/tasks', { data: body })
+  expect(res.ok()).toBeTruthy()
+  const json = await res.json()
+  const id = json.data.id as number
+  cleanUpLater(id)
+  return id
+}
+
+test.afterEach(async ({ authenticatedPage: page }) => {
+  // `splice` rather than a re-assignment: the list must be empty for the next
+  // test even if a delete throws part-way through.
+  const ids = madeByThisTest.splice(0)
+  // Already-trashed rows answer 400 ("Task is already in trash"), which is the
+  // normal case for anything the test deleted through the UI. Cleanup asserts
+  // nothing; it only has to leave the database as it found it.
+  for (const id of ids) await page.request.delete(`/api/tasks/${id}`)
+})
+
+/**
+ * Compile /quotas before any test's clock is running.
+ *
+ * The E2E server is `next dev`, which compiles a route the first time it is
+ * asked for, and this file holds the suite's only /quotas navigations — so the
+ * whole compile landed inside whichever test reached the page first. On CI that
+ * was the quota-range test, which is why it needed 15s of its 30s budget on a
+ * healthy runner and ran straight past 30s on a slow one. Measured locally:
+ * 22.2s for that test on a cold route, 6-7s once warm.
+ *
+ * A `beforeAll` has its own budget, so the compile is no longer charged to a
+ * test. The tradeoff is a request that asserts nothing — a few seconds on a
+ * cold server, next to nothing on a warm one. It relocates the cost rather than
+ * removing it; the real fix is to stop serving E2E from a dev server at all
+ * (`next build && next start`, the way the integration suite already runs).
+ */
+test.beforeAll(async () => {
+  const ctx = await apiRequest.newContext({ baseURL: test.info().project.use.baseURL })
+  try {
+    // Unauthenticated is fine: /quotas redirects on the client, so the server
+    // still renders — and therefore compiles — the route. /api/quotas answers
+    // 401 and compiles just the same. Warm-up only, so failures are ignored.
+    await Promise.all([ctx.get('/quotas'), ctx.get('/api/quotas')])
+  } catch {
+    // A cold server that cannot be reached yet is the webServer's problem, not
+    // this hook's — the first real test will report it properly.
+  } finally {
+    await ctx.dispose()
+  }
+})
+
+const VIEWS = ['Now', 'Newest'] as const
+type View = (typeof VIEWS)[number]
+/** The view toggle persists server-side for the shared test user; tests put it back. */
+async function pressedView(page: Page): Promise<View | null> {
+  for (const v of VIEWS) {
+    const b = page.getByRole('button', { name: v, exact: true })
+    if ((await b.getAttribute('aria-pressed')) === 'true') return v
+  }
+  return null
+}
+async function switchView(page: Page, v: View) {
+  const saved = waitForPreferenceSave(page, 'default_grouping')
+  await page.getByRole('button', { name: v, exact: true }).click()
+  await saved
+}
+
+test.describe('Track', () => {
+  test('the Track panel shows a quota, logs +1 and −1, and reads "met" at target', async ({
+    authenticatedPage: page,
+  }) => {
+    // A weekly quota whose rule "occurs" on some other weekday: the panel must
+    // show it every day regardless.
+    const id = await createTask(page, {
+      title: 'Eggs for the kids',
+      progress_target: 2,
+      rrule: 'FREQ=WEEKLY;BYDAY=WE',
+    })
+    // A quota with a target of 1 — only the flag makes it one — on a different
+    // period, so the chips say their periods and the header says none.
+    const nightId = await createTask(page, {
+      title: 'Date night',
+      rrule: 'FREQ=MONTHLY',
+      is_tracked: true,
+    })
+
+    let viewBefore: View | null = null
+    try {
+      await page.goto('/')
+      const panel = page.getByRole('region', { name: 'Quotas' })
+      await expect(panel).toBeVisible()
+      // The quota as a chip — the panel's only layout (the rows view and its
+      // "Show as rows" switch are gone, 2026-09-29).
+      await expect(panel.getByRole('button', { name: /^Show as (rows|chips)$/ })).toHaveCount(0)
+      const night = panel.locator(`[data-track-chip="${nightId}"]`)
+      await expect(night).toContainText('Date night')
+      // No period suffix on the chip's own count — the section it sits in
+      // says the period now (Trent, 2026-09-23, the period-first redesign).
+      await expect(night.locator('[data-track-count]')).toHaveAttribute('data-count', '0/1')
+      // Each quota sits in ITS OWN period's section, not a shared one — a
+      // monthly quota and a weekly quota never share a `data-quota-period`.
+      // Scoped assertions rather than exact panel-wide counts throughout this
+      // test: the shared E2E database may hold other quotas in other periods
+      // (this file's own comments document that leakage risk above).
+      const weekSection = panel.locator('[data-quota-period="WEEKLY"]')
+      const monthSection = panel.locator('[data-quota-period="MONTHLY"]')
+      await expect(weekSection).toBeVisible()
+      await expect(monthSection).toBeVisible()
+      await expect(weekSection.locator(`[data-track-chip="${id}"]`)).toHaveCount(1)
+      await expect(monthSection.locator(`[data-track-chip="${nightId}"]`)).toHaveCount(1)
+      await expect(monthSection.locator(`[data-track-chip="${id}"]`)).toHaveCount(0)
+      // Each section's bar carries an accessible description combining fill
+      // and elapsed time — never a specific number, since "how much of the
+      // week is gone" depends on when the suite happens to run.
+      await expect(weekSection.locator('[data-track-period-bar]')).toHaveAttribute(
+        'aria-valuetext',
+        /^\d+% done, \d+% of the week gone$/,
+      )
+      await expect(monthSection.locator('[data-track-period-bar]')).toHaveAttribute(
+        'aria-valuetext',
+        /^\d+% done, \d+% of the month gone$/,
+      )
+      // ...and the muted time-left clause reads one of its two shapes.
+      // `toContainText` with a RegExp is a substring search, so no `^`/`$`
+      // anchors here — the section holds plenty of other text around it.
+      await expect(weekSection).toContainText(/\d+ days? left/)
+      await expect(monthSection).toContainText(/\d+ days? left/)
+      const stream = panel.getByRole('list', { name: 'Quotas' })
+      await expect(stream).toHaveCount(1)
+      await expect(stream).toContainText('Date night')
+      await expect(stream).toContainText('Eggs for the kids')
+      await expect(panel.locator('[data-track-heading]')).not.toContainText('this')
+      const chip = panel.locator(`[data-track-chip="${id}"]`)
+      const chipCount = chip.locator('[data-track-count]')
+      await expect(chipCount).toHaveAttribute('data-count', '0/2')
+
+      // Tap: +1, with a toast whose Undo takes it back — and the server ends
+      // where the chip says it does.
+      //
+      // This is the ordering guard, so the two clicks must stay BACK TO BACK:
+      // nothing here may wait for the +1 to reach the server, because the bug
+      // it pins only exists while the +1 and the −1 are in flight together.
+      // From a count of 0, applied in the wrong order, the server's
+      // clamp-at-zero ate the −1 and left 1 behind — invisible until the next
+      // reload, since the optimistic display shows the local value throughout.
+      // `useTrackProgress` queues a task's logs for exactly this.
+      //
+      // Counting the responses rather than polling the count to 0 matters: the
+      // task starts AT 0, so a poll would be satisfied by its own first read,
+      // before either mutation had landed, and would pass on the broken code.
+      // Waiting for both logs to come back and then reading once cannot.
+      let settledLogs = 0
+      const countLogs = (r: Response) => {
+        if (r.request().method() === 'POST' && r.url().endsWith(`/api/tasks/${id}/progress`))
+          settledLogs++
+      }
+      page.on('response', countLogs)
+      await chip.click()
+      await expect(chipCount).toHaveAttribute('data-count', '1/2')
+      const toast = page
+        .locator('[data-sonner-toast]')
+        .filter({ hasText: 'Logged one for \u201cEggs for the kids\u201d \u00b7 1/2' })
+      await expect(toast).toBeVisible()
+      await toast.getByRole('button', { name: 'Undo' }).click()
+      await expect(chipCount).toHaveAttribute('data-count', '0/2')
+      await expect.poll(() => settledLogs).toBe(2)
+      page.off('response', countLogs)
+      expect(
+        (await (await page.request.get(`/api/tasks/${id}`)).json()).data.progress_current,
+      ).toBe(0)
+
+      // Subtracting: shift-click and right-click. A hold no longer subtracts —
+      // since 2026-09-06 it opens the detail sheet, and the swipe took over −1.
+      await chip.click()
+      await chip.click()
+      // Met DURING the session: it stays put, green, for its 5-second
+      // countdown — and taking it back below target (the next line, well
+      // inside the 5s) cancels that, so it never leaves.
+      await expect(chipCount).toHaveAttribute('data-count', '2/2')
+      await chip.click({ modifiers: ['Shift'] })
+      await expect(chipCount).toHaveAttribute('data-count', '1/2')
+      await chip.click({ button: 'right' })
+      await expect(chipCount).toHaveAttribute('data-count', '0/2')
+
+      // A hold opens a popover anchored to the chip — the shape Trent asked
+      // for on 2026-09-06 ("still the same concept but not hover"). It reads,
+      // it does not edit, and the click trailing the hold is not a tap.
+      await chip.click({ delay: 500 })
+      const pop = page.locator('[data-track-popover]')
+      await expect(pop).toBeVisible()
+      await expect(pop).toContainText('Never yet')
+      await expect(pop.getByRole('textbox')).toHaveCount(0)
+      await expect(chipCount).toHaveAttribute('data-count', '0/2')
+
+      // Open is the answer to "how do I even edit the Track items": a quota is
+      // an ordinary task, and it gets its OWN editor — no due date, no snooze
+      // grid, no Done, none of which mean anything for "twice a week". It
+      // opens AS A MODAL, in place — Trent, 2026-09-21: "whenever I do things
+      // with tasks it opens a modal... that's how I like to work: with a
+      // modal" — not a navigation, so the URL never changes.
+      const urlBeforeOpen = page.url()
+      await pop.getByRole('button', { name: 'Open' }).click()
+      const editor = page.getByRole('dialog')
+      await expect(editor).toBeVisible()
+      expect(page.url()).toBe(urlBeforeOpen)
+      // The bubble it was pressed from is gone — the editor replaced it.
+      await expect(pop).toBeHidden()
+      await expect(editor.getByRole('button', { name: 'Every week' })).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      )
+      await expect(editor.getByRole('button', { name: '+1 hr' })).toHaveCount(0)
+      await expect(editor.getByRole('button', { name: 'Done', exact: true })).toHaveCount(0)
+      // The full page is still one button away.
+      await expect(editor.getByRole('button', { name: 'Open full page' })).toBeVisible()
+      await page.keyboard.press('Escape')
+      await expect(page.getByRole('dialog')).toHaveCount(0)
+
+      // In Now, with every fold lifted, it is not also a row in the list: the
+      // panel is its only home there.
+      viewBefore = await pressedView(page)
+      const nowToggle = page.getByRole('button', { name: 'Now', exact: true })
+      if (viewBefore !== 'Now') await switchView(page, 'Now')
+      await expect(nowToggle).toHaveAttribute('aria-pressed', 'true')
+      await showAllNow(page)
+      await expect(page.locator(`#task-row-${id}`)).toHaveCount(0)
+      await expect(chip).toBeVisible()
+      await expect(chipCount).toHaveAttribute('data-count', '0/2')
+
+      // Reaching the target is "met": a state, not an exit — and overflow
+      // stays observable (Trent, Jul 26): the third egg shows as 3/2. Back to
+      // back, well inside the met chip's 5-second countdown.
+      await chip.click()
+      await chip.click()
+      await expect(chipCount).toHaveAttribute('data-count', '2/2')
+      await chip.click()
+      await expect(chipCount).toHaveAttribute('data-count', '3/2')
+
+      // The task itself is still open — progress is not completion. Polled, not
+      // read once: the count on screen is optimistic and the +1 behind it is
+      // still on the wire (`useTrackProgress` sends a task's logs one at a
+      // time), so a single read races the request it is checking on.
+      await expect
+        .poll(async () => {
+          const res = await page.request.get(`/api/tasks/${id}`)
+          const task = (await res.json()).data
+          return { done: task.done, progress_current: task.progress_current }
+        })
+        .toEqual({ done: false, progress_current: 3 })
+    } finally {
+      // The view toggle persists server-side; put it back for later tests.
+      if (viewBefore && viewBefore !== 'Now') await switchView(page, viewBefore)
+    }
+  })
+
+  /**
+   * The chip's popover Open button now opens `QuotaDetailModal` in place
+   * (see the test above) instead of navigating to the task page — this pins
+   * that its delete still goes through the same soft-delete-with-undo path
+   * the Quotas page and the full-page editor use.
+   */
+  /**
+   * The "Quotas" heading is plain text (2026-09-24: Trent kept flipping the
+   * view by tapping it), and since 2026-09-29 there is no rows layout at all —
+   * no "Show as rows / Show as chips" switch anywhere on the panel.
+   */
+  test('the heading is not a control, and there is no rows layout to switch to', async ({
+    authenticatedPage: page,
+  }) => {
+    const id = await createTask(page, {
+      title: 'Probe track view switch',
+      progress_target: 2,
+      rrule: 'FREQ=WEEKLY',
+    })
+    await page.goto('/')
+    const panel = page.getByRole('region', { name: 'Quotas' })
+    const chip = panel.locator(`[data-track-chip="${id}"]`)
+    await expect(chip).toBeVisible()
+
+    const heading = panel.locator('[data-track-heading]')
+    await expect(heading).toHaveText('Quotas')
+    await expect(panel.getByRole('button', { name: 'Quotas', exact: true })).toHaveCount(0)
+    await heading.click()
+    await expect(chip).toBeVisible()
+
+    await expect(page.getByRole('button', { name: /^Show as (rows|chips)$/ })).toHaveCount(0)
+    await expect(page.locator('[data-track-view-switch], [data-track-view-toggle]')).toHaveCount(0)
+  })
+
+  test('a long title wraps onto a second line instead of ellipsising', async ({
+    authenticatedPage: page,
+  }) => {
+    // Trent, 2026-10-12: long quota titles used to wrap; "…" hid what they were.
+    await page.setViewportSize({ width: 390, height: 844 })
+    const title = 'Probe wrap — 30 min: inbound replies, one application, refresh the career notes'
+    const id = await createTask(page, { title, progress_target: 2, rrule: 'FREQ=WEEKLY' })
+    await page.goto('/')
+    const panel = page.getByRole('region', { name: 'Quotas' })
+    const chip = panel.locator(`[data-track-chip="${id}"]`)
+    // A phone folds each period to its bar; open them so the chip is drawn.
+    await expect(panel.locator('[data-track-period-toggle]').first()).toBeVisible()
+    for (const toggle of await panel
+      .locator('[data-track-period-toggle][aria-expanded="false"]')
+      .all()) {
+      await toggle.click()
+    }
+    await expect(chip).toBeVisible()
+    await expect(chip).toContainText(title)
+    // Taller than the one-line 28px chip, and nothing clipped.
+    expect((await chip.boundingBox())!.height).toBeGreaterThan(30)
+    const clipped = await chip.evaluate((el) =>
+      Array.from(el.querySelectorAll('span')).some((s) => s.scrollWidth > s.clientWidth + 1),
+    )
+    expect(clipped).toBe(false)
+  })
+
+  test("deletes a quota from the chip's modal, with an Undo", async ({
+    authenticatedPage: page,
+  }) => {
+    const id = await createTask(page, {
+      title: 'Probe track modal delete',
+      progress_target: 2,
+      rrule: 'FREQ=WEEKLY',
+    })
+    await page.goto('/')
+    const panel = page.getByRole('region', { name: 'Quotas' })
+    await expect(panel).toBeVisible()
+    const chip = panel.locator(`[data-track-chip="${id}"]`)
+    await expect(chip).toBeVisible()
+
+    await chip.click({ delay: 500 })
+    await page.locator('[data-track-popover]').getByRole('button', { name: 'Open' }).click()
+    const editor = page.getByRole('dialog')
+    await expect(editor).toBeVisible()
+
+    const deleted = page.waitForResponse(
+      (r) => r.url().includes('/api/tasks/bulk/delete') && r.request().method() === 'POST',
+    )
+    await editor.getByRole('button', { name: 'Move to Trash' }).click()
+    expect((await deleted).status()).toBe(200)
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+    await expect(page.locator(`[data-track-chip="${id}"]`)).toHaveCount(0)
+
+    // The same Undo every soft delete offers.
+    await page.locator('[data-sonner-toast]').getByRole('button', { name: 'Undo' }).click()
+    await expect(page.locator(`[data-track-chip="${id}"]`)).toBeVisible()
+  })
+
+  test('a quota edits its cadence in its own editor, and is retired by deleting', async ({
+    authenticatedPage: page,
+  }) => {
+    const id = await createTask(page, {
+      title: 'Walk the dog',
+      progress_target: 3,
+      is_tracked: true,
+      rrule: 'FREQ=WEEKLY',
+    })
+
+    await page.goto(`/tasks/${id}`)
+    const editor = page.locator(`[data-quota-detail="${id}"]`)
+    await expect(editor).toBeVisible()
+
+    // Target, flag and rule travel together in one PATCH — validation rejects
+    // a bare FREQ rrule that does not also say the task is tracked.
+    await editor.getByRole('textbox', { name: 'Times per period' }).fill('5')
+    await editor.getByRole('button', { name: 'Every day' }).click()
+    await editor.getByRole('button', { name: 'Save' }).click()
+    await page.waitForResponse(
+      (r) => r.url().includes(`/api/tasks/${id}`) && r.request().method() === 'PATCH',
+    )
+
+    await page.reload()
+    const after = page.locator(`[data-quota-detail="${id}"]`)
+    await expect(after.getByRole('button', { name: 'Every day' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    await expect(after.getByRole('textbox', { name: 'Times per period' })).toHaveValue('5')
+
+    // A quota is retired by deleting it, not by being turned back into a
+    // task: there is no "stop tracking", because a quota is its own kind of
+    // thing rather than a task wearing a counter.
+    await expect(after.getByRole('button', { name: 'Stop tracking' })).toHaveCount(0)
+    await expect(after.getByRole('button', { name: 'Move to Trash' })).toBeVisible()
+  })
+
+  // A quota's priority paces its period's nag while its prompt waits (Trent,
+  // 2026-10-22): the editor has the reminder editor's priority row — the same
+  // chips and hint (`PriorityChips`) — and a save sends priority alone.
+  for (const viewport of [
+    { width: 1280, height: 800 },
+    { width: 375, height: 812 },
+  ]) {
+    test(`a quota's priority is the reminder editor's row, saved with an Undo (${viewport.width}px)`, async ({
+      authenticatedPage: page,
+    }) => {
+      await page.setViewportSize(viewport)
+      const id = await createTask(page, {
+        title: 'Water the plants',
+        progress_target: 3,
+        is_tracked: true,
+        rrule: 'FREQ=WEEKLY',
+      })
+      const priorityOf = async () =>
+        (await (await page.request.get(`/api/tasks/${id}`)).json()).data.priority
+
+      await page.goto(`/tasks/${id}`)
+      const editor = page.locator(`[data-quota-detail="${id}"]`)
+      await expect(editor.locator('[data-priority-chip="0"]')).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      )
+      await expect(editor.getByText('Also sets how often its period nags.')).toBeVisible()
+
+      await editor.locator('[data-priority-chip="3"]').click()
+      await expect(editor.locator('[data-priority-chip="3"]')).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      )
+      const saved = page.waitForResponse(
+        (r) => r.url().includes(`/api/tasks/${id}`) && r.request().method() === 'PATCH',
+      )
+      await editor.getByRole('button', { name: 'Save' }).click()
+      const response = await saved
+      expect(response.status()).toBe(200)
+      // Only what was touched travels: no target, rule or label with it.
+      expect(response.request().postDataJSON()).toEqual({ priority: 3 })
+      await expect.poll(priorityOf).toBe(3)
+
+      // The same Undo every quota edit offers.
+      await page.locator('[data-sonner-toast]').getByRole('button', { name: 'Undo' }).click()
+      await expect.poll(priorityOf).toBe(0)
+    })
+  }
+
+  /**
+   * §5, Trent 2026-09-09, choosing variation G of the `track-by-label` mockup:
+   * a cluster's heading is a PEER of its chips rather than a box around them
+   * — asserted as DOM shape (same flex parent, one wrapping list).
+   *
+   * Amended the same day, on the dev build: a title landing mid-row after the
+   * previous cluster's last chip read as confusing rather than compact, so
+   * every title started its own row from then on.
+   *
+   * REDESIGNED 2026-09-23 (`mock4`): the panel now groups by PERIOD first —
+   * this cluster stream lives INSIDE one period's section
+   * (`[data-quota-period]`), not the whole panel — and a title's row is now
+   * its OWN, full stop: chips wrap in below it rather than sharing its line
+   * while open, where the 09-09 design let them. Both are measured as
+   * equalities, not tolerances: the title's left edge IS its section's left
+   * edge, and zero chips overlap its row on EITHER side.
+   */
+  test('each label title starts a row, in label order, the no-label cluster last — inside one period section', async ({
+    authenticatedPage: page,
+  }) => {
+    const ids: number[] = []
+    // "dev" and "work" are registered by the seed, and sort in that order.
+    // All three WEEKLY, so all three land in one section and its label
+    // ordering is the thing under test — different periods would put each in
+    // its own single-cluster section, with nothing left to order.
+    const devId = await createTask(page, {
+      title: 'Probe stream dev quota',
+      progress_target: 2,
+      rrule: 'FREQ=WEEKLY',
+      labels: ['dev'],
+      create_label: true,
+    })
+    const workId = await createTask(page, {
+      title: 'Probe stream work quota',
+      progress_target: 3,
+      rrule: 'FREQ=WEEKLY',
+      labels: ['work'],
+      create_label: true,
+    })
+    const bareId = await createTask(page, {
+      title: 'Probe stream bare quota',
+      progress_target: 1,
+      is_tracked: true,
+      rrule: 'FREQ=WEEKLY',
+    })
+    // A different period, so the section-scoping half of this test has
+    // something to prove: this quota must stay OUT of the WEEKLY section.
+    const monthlyId = await createTask(page, {
+      title: 'Probe stream monthly quota',
+      progress_target: 1,
+      is_tracked: true,
+      rrule: 'FREQ=MONTHLY',
+      labels: ['dev'],
+    })
+    ids.push(devId, workId, bareId, monthlyId)
+
+    await page.goto('/')
+    const panel = page.getByRole('region', { name: 'Quotas' })
+    await expect(panel).toBeVisible()
+
+    // Exactly one WEEKLY section for the whole panel, however many weekly
+    // quotas exist — `groupByPeriod` merges them into one group — so this
+    // locator resolves to one element regardless of what the shared E2E
+    // database otherwise holds.
+    const weekSection = panel.locator('[data-quota-period="WEEKLY"]')
+    const monthSection = panel.locator('[data-quota-period="MONTHLY"]')
+    await expect(weekSection).toBeVisible()
+    const stream = weekSection.locator(':scope > ul')
+
+    // One list holds every cluster in this section: no card, no sub-list,
+    // per label.
+    await expect(stream).toHaveCount(1)
+    // '' is the no-label cluster's key: a label name is validated non-empty,
+    // so it is the one key no real label can collide with.
+    for (const key of ['dev', 'work', '']) {
+      await expect(stream.locator(`[data-track-cluster="${key}"]`)).toBeVisible()
+    }
+
+    // A title and the chips it introduces are siblings — direct children of
+    // the same wrapping list.
+    for (const [key, id] of [
+      ['dev', devId],
+      ['work', workId],
+      ['', bareId],
+    ] as const) {
+      await expect(stream.locator(`:scope > li[data-track-cluster="${key}"]`)).toHaveCount(1)
+      await expect(stream.locator(`:scope > li:has([data-track-chip="${id}"])`)).toHaveCount(1)
+    }
+
+    // ...and that parent is the wrapping flex row itself.
+    expect(
+      await stream.evaluate((el) => {
+        const s = getComputedStyle(el)
+        return { display: s.display, wrap: s.flexWrap }
+      }),
+    ).toEqual({ display: 'flex', wrap: 'wrap' })
+
+    // Alphabetical by label, and the unlabelled cluster is the leftovers —
+    // last however the names happen to sort.
+    const order = await stream
+      .locator('[data-track-cluster]')
+      .evaluateAll((els) => els.map((el) => el.getAttribute('data-track-cluster')))
+    expect(order.indexOf('dev')).toBeLessThan(order.indexOf('work'))
+    // The panel calls the no-label group "Other"; the Quotas page still says
+    // "Unlabelled", which has a card header with room for the longer word.
+    //
+    // Read off the name span, not the whole heading: the heading also carries
+    // the cluster's shut-state summary ("1 left"), which is in the DOM at
+    // every width — it is CSS, not React, that decides whether it shows, so
+    // that the fold's default needs no JavaScript to paint correctly.
+    await expect(stream.locator('[data-track-cluster=""] [data-track-cluster-name]')).toHaveText(
+      'Other',
+    )
+    expect(order[order.length - 1]).toBe('')
+
+    // EVERY title starts its own row AND ends it (Trent, 2026-09-23: a
+    // label's chips wrap in below it now, never beside it): its left edge is
+    // the section's own left edge, and no chip overlaps its row at all — not
+    // just to the left, which is all the 09-09 layout needed to rule out.
+    const rowStarts = await stream.evaluate((ul) => {
+      const listLeft = ul.getBoundingClientRect().left
+      const chips = [...ul.querySelectorAll('[data-track-chip]')].map((c) =>
+        c.getBoundingClientRect(),
+      )
+      return [...ul.querySelectorAll('[data-track-cluster]')].map((el) => {
+        const r = el.getBoundingClientRect()
+        return {
+          cluster: el.getAttribute('data-track-cluster'),
+          offsetFromListLeft: r.left - listLeft,
+          // Vertical overlap only, no left/right split — a boolean about
+          // boxes, with no pixel slack in it.
+          chipsOnItsRow: chips.filter((c) => c.bottom > r.top && c.top < r.bottom).length,
+        }
+      })
+    })
+    expect(rowStarts.length).toBe(3)
+    for (const t of rowStarts) {
+      expect({ cluster: t.cluster, offset: t.offsetFromListLeft }).toEqual({
+        cluster: t.cluster,
+        offset: 0,
+      })
+      expect({ cluster: t.cluster, chipsOnItsRow: t.chipsOnItsRow }).toEqual({
+        cluster: t.cluster,
+        chipsOnItsRow: 0,
+      })
+    }
+
+    // Each WEEKLY quota is in this section's stream exactly once, with no
+    // period suffix on its chip any more — the section already says it. The
+    // MONTHLY quota is elsewhere: a section holds only its own period.
+    for (const id of [devId, workId, bareId]) {
+      await expect(stream.locator(`[data-track-chip="${id}"]`)).toHaveCount(1)
+    }
+    await expect(weekSection.locator(`[data-track-chip="${monthlyId}"]`)).toHaveCount(0)
+    await expect(monthSection.locator(`[data-track-chip="${monthlyId}"]`)).toBeVisible()
+    await expect(stream.locator(`[data-track-chip="${devId}"] [data-track-count]`)).toHaveAttribute(
+      'data-count',
+      '0/2',
+    )
+    await expect(
+      stream.locator(`[data-track-chip="${workId}"] [data-track-count]`),
+    ).toHaveAttribute('data-count', '0/3')
+    await expect(
+      stream.locator(`[data-track-chip="${bareId}"] [data-track-count]`),
+    ).toHaveAttribute('data-count', '0/1')
+  })
+
+  /**
+   * Was "…a finished label stacks at the foot…" — that chip stack
+   * (`FinishedClusters`) does not exist inside a period section (Trent,
+   * 2026-09-23: disliked the green box specifically there; the section's own
+   * heading already says "M of M"). What replaces it is STILL BEING DECIDED
+   * (see `finishedClusterInSection`), so for now a fully put-away cluster
+   * simply leaves the section with nothing standing in for it — which is what
+   * this test now pins, alongside the parts that did not change: put-away
+   * happens at load, not mid-session, and the header's "X of Y" toggle is
+   * still the only way back.
+   */
+  test('met at load is put away; met mid-session fades and goes 5s later, no reload', async ({
+    authenticatedPage: page,
+  }) => {
+    // A run-unique label, so this cluster holds exactly these two.
+    const label = `zz-hide-${Date.now()}`
+    const done = await createTask(page, {
+      title: 'Hide probe done',
+      progress_target: 1,
+      is_tracked: true,
+      rrule: 'FREQ=MONTHLY',
+      labels: [label],
+      create_label: true,
+    })
+    const open = await createTask(page, {
+      title: 'Hide probe open',
+      progress_target: 1,
+      is_tracked: true,
+      rrule: 'FREQ=MONTHLY',
+      labels: [label],
+    })
+    expect(
+      (await page.request.post(`/api/tasks/${done}/progress`, { data: { delta: 1 } })).ok(),
+    ).toBeTruthy()
+
+    // Playwright's clock from here on, so the 5-second countdown is jumped
+    // with `fastForward`, never waited out.
+    await page.clock.install()
+    await page.goto('/')
+    const panel = page.getByRole('region', { name: 'Quotas' })
+    const monthSection = panel.locator('[data-quota-period="MONTHLY"]')
+    const cluster = monthSection.locator(`[data-track-cluster="${label}"]`)
+    const doneChip = panel.locator(`[data-track-chip="${done}"]`)
+    const openChip = panel.locator(`[data-track-chip="${open}"]`)
+    const toggle = panel.locator('[data-track-met-toggle]')
+
+    // Met at load: put away. The label stays for its unmet quota, inside its
+    // period's own section, and says how many it has closed beside its name.
+    await expect(monthSection).toBeVisible()
+    await expect(openChip).toBeVisible()
+    await expect(doneChip).toHaveCount(0)
+    await expect(cluster.locator('[data-track-cluster-met]')).toHaveText('1')
+    await expect(toggle).toHaveText(/^\d+ of \d+$/)
+
+    // Met now, mid-session: it stays where it is, green, fading — nothing
+    // vanishes under the finger (Trent, 2026-09-22) — and 5 seconds later it
+    // is put away without a reload (Trent, 2026-09-28), taking the finished
+    // label with it: no chip, no box, nothing else takes its place.
+    await openChip.click()
+    await expect(openChip.locator('[data-track-count]')).toHaveAttribute('data-count', '1/1')
+    await expect(openChip).toBeVisible()
+    await expect(cluster).toBeVisible()
+    await expect(
+      panel.locator(`li[data-track-leaving]:has([data-track-chip="${open}"])`),
+    ).toHaveCount(1)
+    await expect
+      .poll(async () => (await (await page.request.get(`/api/tasks/${open}`)).json()).data)
+      .toMatchObject({ progress_current: 1 })
+    await page.clock.fastForward('00:05')
+    await expect(openChip).toHaveCount(0)
+    await expect(cluster).toHaveCount(0)
+
+    // A load agrees. The section's own heading still counts it (asserted via
+    // the header's toggle below): the panel's period math runs over every
+    // quota, not just the ones still on screen.
+    await page.reload()
+    await expect(cluster).toHaveCount(0)
+    await expect(openChip).toHaveCount(0)
+    await expect(doneChip).toHaveCount(0)
+
+    // The header count is still the only way back — panel-wide, unaffected
+    // by which section a quota happens to sit in.
+    await expect(toggle).toBeVisible()
+    await toggle.click()
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    await expect(cluster).toBeVisible()
+    await expect(doneChip).toBeVisible()
+    await expect(openChip).toBeVisible()
+    await toggle.click()
+    await expect(cluster).toHaveCount(0)
+  })
+
+  test('an ordinary task is a row in the day, not a line in the panel', async ({
+    authenticatedPage: page,
+  }) => {
+    const id = await createTask(page, { title: 'Plain one-off task' })
+    let before: View | null = null
+    try {
+      await page.goto('/')
+      await expect(page.getByRole('button', { name: 'Now', exact: true })).toBeVisible()
+      before = await pressedView(page)
+      if (before !== 'Now') await switchView(page, 'Now')
+      // An undated, unprioritised one-off isn't relevant now: it sits behind
+      // its project's "+ N more" fold, which Show all lifts.
+      await showAllNow(page)
+      const row = page.locator(`#task-row-${id}`)
+      await expect(row).toBeVisible()
+      await expect(page.locator(`[data-track-chip="${id}"]`)).toHaveCount(0)
+    } finally {
+      if (before && before !== 'Now') await switchView(page, before)
+    }
+  })
+
+  /**
+   * §5, amended 2026-09-08 (Trent): "a quota is not a task. It appears on the
+   * Quotas page and in the Track panel and nowhere else." It used to be a plain
+   * row in the All list wearing a "1 / 3 this week" chip, which put a thing
+   * with no due date, no snooze and no Done in among things that have all
+   * three. This pins both halves: gone from the list, still in the panel.
+   */
+  test('a quota is absent from the task list but still in the Track panel', async ({
+    authenticatedPage: page,
+  }) => {
+    const id = await createTask(page, {
+      title: 'Chip quota',
+      progress_target: 3,
+      rrule: 'FREQ=WEEKLY;BYDAY=WE',
+    })
+    let before: View | null = null
+    let siblingProjectId: number | null = null
+    try {
+      const logged = await page.request.post(`/api/tasks/${id}/progress`, { data: { delta: 1 } })
+      expect(logged.ok()).toBeTruthy()
+      await page.goto('/')
+      await expect(page.getByRole('button', { name: 'Now', exact: true })).toBeVisible()
+      before = await pressedView(page)
+      if (before !== 'Now') await switchView(page, 'Now')
+
+      // A plain task is here, so an empty assertion below cannot pass by the
+      // list simply not having rendered. In a project of its own: Show all
+      // caps each project group (`project_preview_count`), and the shared
+      // user's Inbox holds more than that.
+      const project = await page.request.post('/api/projects', {
+        data: { name: `Track sibling ${Date.now()}` },
+      })
+      expect(project.ok()).toBeTruthy()
+      siblingProjectId = (await project.json()).data.id as number
+      const plainId = await createTask(page, {
+        title: 'Plain sibling task',
+        project_id: siblingProjectId,
+      })
+      await page.reload()
+      if ((await pressedView(page)) !== 'Now') await switchView(page, 'Now')
+      await showAllNow(page)
+      await expect(page.locator(`#task-row-${plainId}`)).toBeVisible()
+      await expect(page.locator(`#task-row-${id}`)).toHaveCount(0)
+
+      // ...and the panel above the list still has it, with its count.
+      const chip = page.locator(`[data-track-chip="${id}"]`)
+      await expect(chip).toBeVisible()
+      await expect(chip.locator('[data-track-count]')).toHaveAttribute('data-count', '1/3')
+    } finally {
+      if (before && before !== 'Now') await switchView(page, before)
+      if (siblingProjectId !== null) await page.request.delete(`/api/projects/${siblingProjectId}`)
+    }
+  })
+})
+
+/** The PATCH of one quota. */
+const isPatchOf = (id: number) => (r: Response) =>
+  r.request().method() === 'PATCH' && r.url().endsWith(`/api/tasks/${id}`)
+
+/** A quota's chip on the dashboard, in the chips view. */
+async function chipOf(page: Page, id: number) {
+  await page.goto('/')
+  const panel = page.getByRole('region', { name: 'Quotas' })
+  await expect(panel).toBeVisible()
+  // On a phone the chip's period starts folded to its bar — open it first.
+  // The toggle is `sm:hidden`, so this is a no-op at desktop widths.
+  const toggle = panel.locator(
+    `[data-quota-period]:has([data-track-chip="${id}"]) [data-track-period-toggle]`,
+  )
+  if (await toggle.isVisible()) await toggle.click()
+  const chip = panel.locator(`[data-track-chip="${id}"]`)
+  await expect(chip).toBeVisible()
+  return chip
+}
+
+/**
+ * Into a chip's bubble — the trailing click is never a +1. On the dashboard a
+ * press and hold opens it; on /quotas the hold SELECTS the chip (2026-10-16,
+ * `useQuotaChipSelection`) and the bubble is the selection bar's Details.
+ */
+async function holdChipOpen(page: Page, chip: ReturnType<Page['locator']>) {
+  await chip.click({ delay: 500 })
+  if (new URL(page.url()).pathname === '/quotas') {
+    await page
+      .locator('[data-quota-selection-bar]')
+      .getByRole('button', { name: 'Details', exact: true })
+      .click()
+  }
+  const pop = page.locator('[data-track-popover]')
+  await expect(pop).toBeVisible()
+  return pop
+}
+
+/**
+ * The bubble is on a 375×812 screen, clear of the top bar and the tab bar,
+ * and no chip pokes past its right edge.
+ */
+async function expectBubbleOnScreen(page: Page, pop: ReturnType<Page['locator']>) {
+  const box = (await pop.boundingBox())!
+  const header = (await page.locator('header').first().boundingBox())!
+  const tabs = (await page.locator('nav.fixed').last().boundingBox())!
+  expect(box.x + box.width).toBeLessThanOrEqual(375)
+  expect(box.y).toBeGreaterThanOrEqual(header.y + header.height)
+  expect(box.y + box.height).toBeLessThanOrEqual(tabs.y)
+  for (const c of await pop.locator('[data-prompt-period]').all()) {
+    const b = (await c.boundingBox())!
+    expect(b.x + b.width).toBeLessThanOrEqual(box.x + box.width)
+  }
+}
+
+/** 1st, 2nd, 3rd, 4th — the default five periods never reach 11th. */
+function ordinalOf(n: number): string {
+  return `${n}${['th', 'st', 'nd', 'rd'][n] ?? 'th'}`
+}
+
+/**
+ * Pin the user's default prompt period to their first period (and quota
+ * reminders on) for each test in the calling describe, and put both back
+ * after. Returns the user's periods by start, filled in before each test.
+ */
+function pinPromptPeriod(): { slots: { id: number; label: string }[] } {
+  const pinned = { slots: [] as { id: number; label: string }[] }
+  let savedPrefs: { quota_prompt_slot_id: number | null; quota_prompts_enabled: boolean }
+  test.beforeEach(async ({ authenticatedPage: page }) => {
+    savedPrefs = (await (await page.request.get('/api/user/preferences')).json()).data
+    const res = await page.request.get('/api/time-slots')
+    const all = (await res.json()).data.time_slots as {
+      id: number
+      label: string
+      start_time: string
+    }[]
+    pinned.slots = [...all].sort((a, b) => a.start_time.localeCompare(b.start_time))
+    await page.request.patch('/api/user/preferences', {
+      data: { quota_prompt_slot_id: pinned.slots[0].id, quota_prompts_enabled: true },
+    })
+  })
+  test.afterEach(async ({ authenticatedPage: page }) => {
+    await page.request.patch('/api/user/preferences', {
+      data: {
+        quota_prompt_slot_id: savedPrefs.quota_prompt_slot_id ?? null,
+        quota_prompts_enabled: savedPrefs.quota_prompts_enabled !== false,
+      },
+    })
+  })
+  return pinned
+}
+
+/**
+ * A quota chip's bubble carries its daily reminder's period chips (2026-09-25)
+ * — the same chips, and the same save, as a prompt row's bubble on Reminders
+ * (quota-prompts.spec.ts): one tap PATCHes `quota_prompt_config`, the toast's
+ * Undo takes it back. A chip stands for the whole quota, so a daily one shows
+ * a row per number. The user's default prompt period is pinned to the first
+ * period for each test (and put back after), so "where it is now" is known.
+ */
+test.describe('Track — moving a quota reminder from its chip', () => {
+  const pinned = pinPromptPeriod()
+
+  test('a period chip moves the quota for good; the toast Undo puts it back', async ({
+    authenticatedPage: page,
+  }) => {
+    const title = `Probe chip move ${Date.now()}`
+    const id = await createTask(page, {
+      title,
+      rrule: 'FREQ=WEEKLY',
+      progress_target: 3,
+      is_tracked: true,
+    })
+    const [first] = pinned.slots
+    const { slots } = pinned
+    const last = slots[slots.length - 1]
+    const chip = await chipOf(page, id)
+    const count = chip.locator('[data-track-count]')
+
+    let pop = await holdChipOpen(page, chip)
+    const periods = pop.locator('[data-prompt-periods]')
+    await expect(periods).toContainText('Reminds me in')
+    await expect(periods.locator('[data-prompt-period]')).toHaveText(slots.map((s) => s.label))
+    await expect(periods.locator('[aria-pressed="true"]')).toHaveText(first.label)
+    // One row for a weekly quota: no per-number grid.
+    await expect(periods.locator('[data-prompt-row]')).toHaveCount(0)
+
+    const saved = page.waitForResponse(isPatchOf(id))
+    await periods.locator(`[data-prompt-period="${last.id}"]`).click()
+    await expect(pop).toHaveCount(0)
+    expect((await (await saved).json()).data.quota_prompt_config).toEqual({ slot_id: last.id })
+    // The hold neither logged nor lost a count.
+    await expect(count).toHaveAttribute('data-count', '0/3')
+
+    const toast = page.locator('[data-sonner-toast]', {
+      hasText: `Moved “${title}” to ${last.label}`,
+    })
+    await expect(toast).toBeVisible()
+    pop = await holdChipOpen(page, chip)
+    await expect(pop.locator('[data-prompt-periods] [aria-pressed="true"]')).toHaveText(last.label)
+    await page.keyboard.press('Escape')
+    await expect(pop).toHaveCount(0)
+
+    const undone = page.waitForResponse((r) => r.url().includes('/api/undo'))
+    await toast.getByRole('button', { name: 'Undo' }).click()
+    await undone
+    await expect
+      .poll(
+        async () =>
+          (await (await page.request.get(`/api/tasks/${id}`)).json()).data.quota_prompt_config,
+      )
+      .toBeNull()
+    pop = await holdChipOpen(page, chip)
+    await expect(pop.locator('[data-prompt-periods] [aria-pressed="true"]')).toHaveText(first.label)
+    await page.keyboard.press('Escape')
+    await expect(pop).toHaveCount(0)
+
+    // The chip's own gestures are untouched: tap +1, right-click −1.
+    await chip.click()
+    await expect(count).toHaveAttribute('data-count', '1/3')
+    await chip.click({ button: 'right' })
+    await expect(count).toHaveAttribute('data-count', '0/3')
+  })
+
+  test('no period chips when the quota, or Settings, has quota reminders off', async ({
+    authenticatedPage: page,
+  }) => {
+    const off = await createTask(page, {
+      title: `Probe chip off ${Date.now()}`,
+      rrule: 'FREQ=WEEKLY',
+      progress_target: 2,
+      is_tracked: true,
+      quota_prompt_config: { enabled: false },
+    })
+    const on = await createTask(page, {
+      title: `Probe chip on ${Date.now()}`,
+      rrule: 'FREQ=WEEKLY',
+      progress_target: 2,
+      is_tracked: true,
+    })
+
+    // The neighbour has them — which also says Settings has loaded, so the
+    // quota whose own switch is off is judged on that switch alone.
+    const panel = page.getByRole('region', { name: 'Quotas' })
+    let pop = await holdChipOpen(page, await chipOf(page, on))
+    await expect(pop.locator('[data-prompt-periods]')).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(pop).toHaveCount(0)
+    pop = await holdChipOpen(page, panel.locator(`[data-track-chip="${off}"]`))
+    await expect(pop).toContainText('Periods met')
+    await expect(pop.locator('[data-prompt-periods]')).toHaveCount(0)
+
+    // Settings off: none anywhere.
+    await page.request.patch('/api/user/preferences', { data: { quota_prompts_enabled: false } })
+    pop = await holdChipOpen(page, await chipOf(page, on))
+    await expect(pop).toContainText('Periods met')
+    await expect(pop.locator('[data-prompt-periods]')).toHaveCount(0)
+  })
+})
+
+/** A successful +1/−1 on one quota — for `page.waitForResponse`. */
+function isProgressOf(id: number) {
+  return (r: Response) => r.url().includes(`/api/tasks/${id}/progress`) && r.ok()
+}
+
+/**
+ * What each period's heading should say — "M of N" — computed from the API
+ * rather than from the quotas this test made: the shared E2E database may hold
+ * other tests' quotas in the same periods, and the heading counts every one.
+ */
+async function expectedPeriodCounts(page: Page): Promise<Map<string, string>> {
+  const res = await page.request.get('/api/tasks?done=false&limit=1000')
+  expect(res.ok()).toBeTruthy()
+  const tasks = (await res.json()).data.tasks as {
+    is_tracked: boolean
+    rrule: string | null
+    progress_current: number | null
+    progress_target: number | null
+  }[]
+  const by = new Map<string, { met: number; count: number }>()
+  for (const t of tasks.filter((t) => t.is_tracked)) {
+    const freq = /FREQ=(\w+)/.exec(t.rrule ?? '')?.[1] ?? 'NONE'
+    const s = by.get(freq) ?? { met: 0, count: 0 }
+    s.count++
+    if ((t.progress_current ?? 0) >= Math.max(1, t.progress_target ?? 1)) s.met++
+    by.set(freq, s)
+  }
+  return new Map([...by].map(([k, s]) => [k, `${s.met} of ${s.count}`]))
+}
+
+/**
+ * Trent, 2026-09-29: "on mobile, I want quotas to start collapsed … segments:
+ * day, week, month. They have the bars fill up so I can see how far I am
+ * towards completing today, this week, and this month. Desktop doesn't need
+ * it." See `PERIOD_BODY` in TrackPanel.tsx.
+ */
+test.describe('Track — periods fold to their bars on a phone', () => {
+  async function seedThree(page: Page) {
+    const tag = `period-fold-${Date.now()}`
+    const daily = await createTask(page, {
+      title: `${tag} daily`,
+      rrule: 'FREQ=DAILY',
+      progress_target: 3,
+      is_tracked: true,
+      labels: [tag],
+      create_label: true,
+    })
+    const weekly = await createTask(page, {
+      title: `${tag} weekly`,
+      rrule: 'FREQ=WEEKLY',
+      progress_target: 2,
+      is_tracked: true,
+      labels: [tag],
+    })
+    const monthly = await createTask(page, {
+      title: `${tag} monthly`,
+      rrule: 'FREQ=MONTHLY',
+      progress_target: 4,
+      is_tracked: true,
+      labels: [tag],
+    })
+    // Some progress, so a bar has something in it.
+    expect(
+      (await page.request.post(`/api/tasks/${weekly}/progress`, { data: { delta: 1 } })).ok(),
+    ).toBeTruthy()
+    return { daily, weekly, monthly }
+  }
+
+  test('at 375×812: one bar per period; tapping a period opens its chips, tapping again folds them', async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 375, height: 812 })
+    const { daily, weekly, monthly } = await seedThree(page)
+    const expected = await expectedPeriodCounts(page)
+    await page.goto('/')
+    const panel = page.getByRole('region', { name: 'Quotas' })
+    await expect(panel.locator('#track-card')).toBeVisible()
+
+    // Day, week, month — in that order, each with its bar and "M of N".
+    const keys: (string | null)[] = []
+    for (const el of await panel.locator('[data-quota-period]').all()) {
+      keys.push(await el.getAttribute('data-quota-period'))
+    }
+    const ours = keys.filter((k) => k === 'DAILY' || k === 'WEEKLY' || k === 'MONTHLY')
+    expect(ours).toEqual(['DAILY', 'WEEKLY', 'MONTHLY'])
+    for (const [key, id] of [
+      ['DAILY', daily],
+      ['WEEKLY', weekly],
+      ['MONTHLY', monthly],
+    ] as const) {
+      const section = panel.locator(`[data-quota-period="${key}"]`)
+      await expect(section.locator('[data-track-period-bar]')).toBeVisible()
+      await expect(section.locator('[data-track-period-count]')).toHaveText(expected.get(key)!)
+      // Folded: no chips, no label clusters.
+      await expect(section.locator(`[data-track-chip="${id}"]`)).toBeHidden()
+      await expect(section.locator('[data-track-cluster]').first()).toBeHidden()
+      await expect(section.locator('[data-track-period-toggle]')).toHaveAttribute(
+        'aria-expanded',
+        'false',
+      )
+    }
+
+    // Tap the week: its chips appear, the others stay folded.
+    const week = panel.locator('[data-quota-period="WEEKLY"]')
+    const toggle = week.locator('[data-track-period-toggle]')
+    await toggle.click()
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    await expect(week.locator(`[data-track-chip="${weekly}"]`)).toBeVisible()
+    await expect(panel.locator(`[data-track-chip="${daily}"]`)).toBeHidden()
+    await expect(panel.locator(`[data-track-chip="${monthly}"]`)).toBeHidden()
+
+    // A chip in an opened period still counts: a tap is +1, and the
+    // period's own bar row follows (the weekly quota is now 2 of 2, met).
+    const [met, count] = expected.get('WEEKLY')!.split(' of ').map(Number)
+    const logged = page.waitForResponse(isProgressOf(weekly))
+    await week.locator(`[data-track-chip="${weekly}"]`).click()
+    await logged
+    await expect(week.locator('[data-track-period-count]')).toHaveText(`${met + 1} of ${count}`)
+
+    // Tap again: folded back to its bar.
+    await toggle.click()
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    await expect(week.locator(`[data-track-chip="${weekly}"]`)).toBeHidden()
+    await expect(week.locator('[data-track-period-bar]')).toBeVisible()
+  })
+
+  test('at 1512 wide: everything is open as before, with no period toggle', async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 1512, height: 900 })
+    const { daily, weekly, monthly } = await seedThree(page)
+    await page.goto('/')
+    const panel = page.getByRole('region', { name: 'Quotas' })
+    for (const id of [daily, weekly, monthly]) {
+      await expect(panel.locator(`[data-track-chip="${id}"]`)).toBeVisible()
+    }
+    await expect(panel.locator('[data-track-period-toggle]:visible')).toHaveCount(0)
+  })
+})
+
+/** A daily quota's numbers, each its own row — or grouped, past a few. */
+test.describe('Track — moving a daily quota reminder, number by number', () => {
+  const pinned = pinPromptPeriod()
+
+  test('a daily quota shows a row per number and moves only that number — at phone width', async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 375, height: 812 })
+    const [first, second] = pinned.slots
+    const { slots } = pinned
+    const last = slots[slots.length - 1]
+    const id = await createTask(page, {
+      title: `Probe chip daily ${Date.now()}`,
+      rrule: 'FREQ=DAILY',
+      progress_target: 2,
+      is_tracked: true,
+    })
+    const chip = await chipOf(page, id)
+
+    const pop = await holdChipOpen(page, chip)
+    const rows = pop.locator('[data-prompt-row]')
+    await expect(rows).toHaveCount(2)
+    const row1 = pop.locator('[data-prompt-row="1"]')
+    const row2 = pop.locator('[data-prompt-row="2"]')
+    await expect(row1).toContainText('1st of 2')
+    await expect(row2).toContainText('2nd of 2')
+    // Where the editor's per-number pickers would show them.
+    await expect(row1.locator('[aria-pressed="true"]')).toHaveText(first.label)
+    await expect(row2.locator('[aria-pressed="true"]')).toHaveText(second.label)
+
+    await expectBubbleOnScreen(page, pop)
+
+    const saved = page.waitForResponse(isPatchOf(id))
+    await row2.locator(`[data-prompt-period="${last.id}"]`).click()
+    expect((await (await saved).json()).data.quota_prompt_config).toEqual({
+      numbers: { '2': last.id },
+    })
+    await expect(
+      page.locator('[data-sonner-toast]', { hasText: `(2nd of 2) to ${last.label}` }),
+    ).toBeVisible()
+
+    const again = await holdChipOpen(page, chip)
+    await expect(again.locator('[data-prompt-row="1"] [aria-pressed="true"]')).toHaveText(
+      first.label,
+    )
+    await expect(again.locator('[data-prompt-row="2"] [aria-pressed="true"]')).toHaveText(
+      last.label,
+    )
+  })
+
+  test('a large daily target groups its numbers by period — the bubble scrolls, never clips', async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 375, height: 812 })
+    const { slots } = pinned
+    const last = slots[slots.length - 1]
+    const id = await createTask(page, {
+      title: `Probe chip daily eight ${Date.now()}`,
+      rrule: 'FREQ=DAILY',
+      progress_target: 8,
+      is_tracked: true,
+    })
+    const pop = await holdChipOpen(page, await chipOf(page, id))
+    // One row per period the numbers sit in, the spill-over sharing the last.
+    const labels = slots.map((_, i) =>
+      i < slots.length - 1 ? `${ordinalOf(i + 1)} of 8` : `${ordinalOf(i + 1)}–8th of 8`,
+    )
+    await expect(pop.locator('[data-prompt-row]')).toHaveCount(slots.length)
+    for (const [i, label] of labels.entries()) {
+      await expect(pop.locator('[data-prompt-row]').nth(i)).toContainText(label)
+    }
+    await expectBubbleOnScreen(page, pop)
+    // Everything is reachable inside it, the footer included.
+    await pop.getByRole('button', { name: 'Open' }).scrollIntoViewIfNeeded()
+    await expect(pop.getByRole('button', { name: 'Open' })).toBeInViewport()
+
+    const saved = page.waitForResponse(isPatchOf(id))
+    await pop.locator(`[data-prompt-row="1"] [data-prompt-period="${last.id}"]`).click()
+    expect((await (await saved).json()).data.quota_prompt_config).toEqual({
+      numbers: { '1': last.id },
+    })
+  })
+})
+
+/**
+ * The Quotas page (§5) — where quotas are made, looked into and retired, as
+ * opposed to the dashboard's Track panel, which is where they are tapped. The
+ * page IS that panel (`QuotasSummary`), with no second view since 2026-10-16
+ * (Trent: "that Details view is pointless… We're going to get rid of that
+ * special view").
+ */
+test.describe('Quotas page', () => {
+  test('is the Quotas panel alone, whose chips count and subtract as on the dashboard', async ({
+    authenticatedPage: page,
+  }) => {
+    const id = await createTask(page, {
+      title: `Probe summary chip ${Date.now()}`,
+      progress_target: 3,
+      rrule: 'FREQ=WEEKLY',
+    })
+    await page.goto('/quotas')
+    const summary = page.locator('[data-quotas-summary]')
+    await expect(summary).toBeVisible()
+    await expect(summary.getByRole('button', { name: 'New quota' })).toBeVisible()
+    // No Summary/Details switch any more, and no second view behind it. (The
+    // selection bar's Details only exists while chips are selected.)
+    await expect(page.getByRole('group', { name: 'Quotas view' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Details', exact: true })).toHaveCount(0)
+
+    // The dashboard's panel itself, not a copy — one "Quotas" region, and
+    // none of what only the dashboard needs (the phone's section fold, the
+    // redundant heading). No chips/rows switch: chips are the only layout.
+    const panel = page.getByRole('region', { name: 'Quotas' })
+    await expect(panel).toHaveCount(1)
+    await expect(panel.getByRole('button', { name: /^Show as (rows|chips)$/ })).toHaveCount(0)
+    await expect(panel.locator('[data-track-section-toggle]')).toHaveCount(0)
+    await expect(panel.locator('[data-track-heading]')).toHaveCount(0)
+
+    // Tap +1, right-click −1, hold-then-Details for the bubble — nothing
+    // logged by the hold.
+    const chip = panel.locator(`[data-track-chip="${id}"]`)
+    const count = chip.locator('[data-track-count]')
+    await expect(count).toHaveAttribute('data-count', '0/3')
+    await chip.click()
+    await expect(count).toHaveAttribute('data-count', '1/3')
+    await chip.click({ button: 'right' })
+    await expect(count).toHaveAttribute('data-count', '0/3')
+    const pop = await holdChipOpen(page, chip)
+    await expect(pop).toContainText('Periods met')
+    await page.keyboard.press('Escape')
+    await expect(pop).toHaveCount(0)
+    await expect(count).toHaveAttribute('data-count', '0/3')
+  })
+
+  /**
+   * What the Details list was for, now behind a chip: "met N×" is the
+   * bubble's record (met, missed, streak, since), the editor is its Open, and
+   * retiring one is its trash can.
+   */
+  test('a quota made here lands as a chip, with its record, editor and trash in its bubble', async ({
+    authenticatedPage: page,
+  }) => {
+    // One quota already there, so the page is the panel, not the empty state.
+    await createTask(page, {
+      title: `Probe summary anchor ${Date.now()}`,
+      progress_target: 2,
+      rrule: 'FREQ=WEEKLY',
+    })
+    await page.goto('/quotas')
+    const summary = page.locator('[data-quotas-summary]')
+    await summary.getByRole('button', { name: 'New quota' }).click()
+    // A modal, not an inline form.
+    const form = page.getByRole('dialog')
+    await expect(form).toBeVisible()
+    await form.getByRole('textbox').first().fill(`Probe summary new ${Date.now()}`)
+    const created = page.waitForResponse(
+      (r) => r.url().endsWith('/api/tasks') && r.request().method() === 'POST',
+    )
+    await form.getByRole('button', { name: 'Create' }).click()
+    // Made through the UI, so `createTask` never saw it — register it by hand
+    // or the afterEach has nothing to clean up.
+    const newId = (await (await created).json()).data.id as number
+    cleanUpLater(newId)
+    const chip = page.locator(`[data-track-chip="${newId}"]`)
+    await expect(chip).toBeVisible()
+
+    // A brand new quota has never been met, and says so; it has no record to
+    // miss either. The record is fetched as the bubble opens.
+    let pop = await holdChipOpen(page, chip)
+    const record = pop.locator('[data-quota-record]')
+    await expect(record).toHaveAttribute('data-quota-record', 'ready')
+    await expect(record.locator('[data-quota-met]')).toHaveText('Never yet')
+    await expect(record.locator('[data-quota-missed]')).toHaveText('Never')
+    await expect(record.locator('[data-quota-streak]')).toHaveText('None yet')
+    await expect(record).toContainText('Tracking since')
+
+    // Open is the editor, as a MODAL over the page.
+    await pop.getByRole('button', { name: 'Open', exact: true }).click()
+    await expect(page.getByRole('dialog')).toBeVisible()
+    await expect(page).toHaveURL(/\/quotas$/)
+    await page.keyboard.press('Escape')
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+
+    // And the bubble's trash can retires it.
+    pop = await holdChipOpen(page, chip)
+    await pop.getByRole('button', { name: /to Trash/ }).click()
+    await expect(chip).toHaveCount(0)
+  })
+
+  /**
+   * The streak counts the period in progress once it is met — a run kept
+   * alive right now should not read one short until the period closes.
+   */
+  test('a met quota’s bubble counts this period into its streak', async ({
+    authenticatedPage: page,
+  }) => {
+    const id = await createTask(page, {
+      title: `Probe streak ${Date.now()}`,
+      progress_target: 2,
+      rrule: 'FREQ=WEEKLY',
+    })
+    expect(
+      (await page.request.post(`/api/tasks/${id}/progress`, { data: { delta: 2 } })).ok(),
+    ).toBeTruthy()
+    await page.goto('/quotas')
+    // Met at load, so put away: "Show met" brings it back to hold.
+    const showMet = page.getByRole('button', { name: /show the met ones/ })
+    await showMet.click()
+    try {
+      const chip = page.locator(`[data-track-chip="${id}"]`)
+      await expect(chip.locator('[data-track-count]')).toHaveAttribute('data-count', '2/2')
+      const pop = await holdChipOpen(page, chip)
+      await expect(pop.locator('[data-quota-streak]')).toHaveText('1 in a row')
+      // Closed periods only: this week has not closed yet.
+      await expect(pop.locator('[data-quota-met]')).toHaveText('Never yet')
+      await page.keyboard.press('Escape')
+    } finally {
+      // "Show met" lives in the fold store every test shares.
+      await page.getByRole('button', { name: /hide the met ones/ }).click()
+    }
+  })
+
+  /**
+   * §5/A3+A4 over the API, split out of the selection test (2026-09-21).
+   *
+   * Retiring takes the period rule with it: a bare "FREQ=WEEKLY" left on an
+   * untracked task with no due date is evaluated as a schedule, and rrule.js
+   * places it on an arbitrary weekday, so the task would surface on a day
+   * nobody chose. There is no "stop tracking" button (see the editor test), so
+   * the API is the whole of the retire path.
+   */
+  test('retiring a quota over the API takes its period rule with it, and Undo brings both back', async ({
+    authenticatedPage: page,
+  }) => {
+    const retireId = await createTask(page, {
+      title: 'Probe quota to retire',
+      progress_target: 2,
+      rrule: 'FREQ=WEEKLY',
+    })
+    await page.goto('/quotas')
+    const chip = page.locator(`[data-track-chip="${retireId}"]`)
+    await expect(chip).toBeVisible()
+
+    const retired = await page.request.patch(`/api/tasks/${retireId}`, {
+      data: { is_tracked: false, progress_target: 1 },
+    })
+    expect(retired.status()).toBe(200)
+    const retiredBody = (await retired.json()).data
+    expect(retiredBody.is_tracked).toBe(false)
+    expect(retiredBody.rrule).toBeNull()
+    expect(retiredBody.due_at).toBeNull()
+    // It is no longer a quota, so it leaves this page. Reload rather than
+    // waiting for the chip to be pushed out: this went through the API, so the
+    // only thing that would move a page already open is the sync stream — and
+    // asserting on a push makes the test depend on delivery timing rather than
+    // on server state. Same for the reload after the undo below.
+    await page.reload()
+    await expect(chip).toHaveCount(0)
+
+    // Undo puts it back, flag and rule together. This is the path that used
+    // to throw inside undo's column allowlist and wedge the whole stack
+    // (`is_tracked` was not on it), so a green 200 here is the contract.
+    const undone = await page.request.post('/api/undo')
+    expect(undone.status()).toBe(200)
+    await page.reload()
+    await expect(chip).toBeVisible()
+
+    // And a quota refuses a snooze outright (§5/A4).
+    const snoozed = await page.request.post(`/api/tasks/${retireId}/snooze`, {
+      data: { until: new Date(Date.now() + 3_600_000).toISOString() },
+    })
+    expect(snoozed.status()).toBe(400)
+  })
+
+  /**
+   * Rapid-tapping is how a count gets to three, so both taps of a double-tap
+   * must land — and the dblclick riding behind them must not open anything
+   * (Trent, 2026-09-06: "if I double-tap the +1 on Oatmeal Berries, then the
+   * modal pops up").
+   */
+  test('double-tapping a chip counts twice and opens nothing', async ({
+    authenticatedPage: page,
+  }) => {
+    const id = await createTask(page, {
+      title: 'Probe rapid tap',
+      progress_target: 5,
+      rrule: 'FREQ=WEEKLY',
+    })
+    await page.goto('/quotas')
+    const chip = page.locator(`[data-track-chip="${id}"]`)
+    const count = chip.locator('[data-track-count]')
+    await expect(count).toHaveAttribute('data-count', '0/5')
+    await chip.dblclick()
+    await expect(count).toHaveAttribute('data-count', '2/5')
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+    await expect(page.locator('[data-track-popover]')).toHaveCount(0)
+  })
+})
+
+test.describe('Quotas page — the ?quota= deep link', () => {
+  /**
+   * `?quota=<id>` — the Track widget's deep link. Trent, 2026-09-22: "quota
+   * still opens up the full detail menu when really it should just
+   * highlight it in the Quotas tab." Mirrors `?reminder=<id>` on
+   * `/reminders` and `?task=<id>&highlight=1` on `/`.
+   *
+   * It lands on a CHIP now (2026-10-16), so the chip must be on the page even
+   * when the page would hide it: a quota met at load is put away. It is shown
+   * for the flash only, and put away again after it. (The other way a chip can
+   * hide, a label cluster folded shut, is opened the same way — but the fold
+   * store lives in memory, so a test's `goto` cannot carry a shut fold into
+   * the deep link's page load.)
+   */
+  test('?quota=<id> brings a put-away chip into view, flashes it, and changes nothing', async ({
+    authenticatedPage: page,
+  }) => {
+    const id = await createTask(page, {
+      title: `Probe quota the widget links to ${Date.now()}`,
+      progress_target: 1,
+      is_tracked: true,
+      rrule: 'FREQ=WEEKLY',
+    })
+    expect(
+      (await page.request.post(`/api/tasks/${id}/progress`, { data: { delta: 1 } })).ok(),
+    ).toBeTruthy()
+
+    await page.goto(`/quotas?quota=${id}`)
+    const chip = page.locator(`[data-track-chip="${id}"]`)
+    await expect(chip).toHaveAttribute('data-quota-highlight', '')
+    await expect(chip).toBeInViewport()
+    // A link is a place to look, not an edit. Nothing opens.
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+    await expect(page.locator('[data-track-popover]')).toHaveCount(0)
+    // The param is spent, so a reload does not flash the same chip again.
+    await expect(page).toHaveURL('/quotas')
+    // Once the flash has played, the page is as it would be without the link:
+    // met at load, so put away.
+    await expect(chip).toHaveCount(0)
+    await page.reload()
+    await expect(page.locator('[data-quotas-summary]')).toBeVisible()
+    await expect(chip).toHaveCount(0)
+  })
+})
+
+/**
+ * The cluster (label) a chip sits under. Clusters and chips are siblings in one
+ * wrapping row per period, so it is the nearest cluster title before the chip.
+ */
+function clusterOf(page: Page, id: number) {
+  return page
+    .locator(`[data-track-chip="${id}"]`)
+    .locator('xpath=ancestor::li[1]/preceding-sibling::li[@data-track-cluster][1]')
+}
+
+test.describe('Quota labels', () => {
+  /**
+   * §5, Trent 2026-09-08: "I think we need to have one label for quotas… there's
+   * a bunch of stuff for the kids and there are other things." The label is the
+   * panel's grouping inside each period, so the picker in the editor and the
+   * cluster a chip sits in are one feature and are tested as one.
+   */
+  test('a quota is grouped by its one label, and the picker moves it', async ({
+    authenticatedPage: page,
+  }) => {
+    const ids: number[] = []
+    // A quota that still carries TWO labels — six on Trent's corpus do, and
+    // the migration deliberately left them alone. It belongs to the FIRST.
+    // `create_label` is §7.2's opt-in: an unknown label is refused without it.
+    ids.push(
+      await createTask(page, {
+        title: 'Probe label two-label',
+        progress_target: 2,
+        rrule: 'FREQ=WEEKLY',
+        labels: ['health', 'kids'],
+        create_label: true,
+      }),
+    )
+    ids.push(
+      await createTask(page, {
+        title: 'Probe label house one',
+        progress_target: 1,
+        is_tracked: true,
+        rrule: 'FREQ=MONTHLY',
+        labels: ['house'],
+        create_label: true,
+      }),
+    )
+
+    await page.goto('/quotas')
+    const panel = page.getByRole('region', { name: 'Quotas' })
+    await expect(panel).toBeVisible()
+
+    // Each lands under its own label, and the two-label one appears ONCE.
+    await expect(clusterOf(page, ids[0])).toHaveAttribute('data-track-cluster', 'health')
+    await expect(panel.locator(`[data-track-chip="${ids[0]}"]`)).toHaveCount(1)
+    await expect(clusterOf(page, ids[1])).toHaveAttribute('data-track-cluster', 'house')
+
+    // Picking a different label moves the chip to that cluster.
+    const pop = await holdChipOpen(page, panel.locator(`[data-track-chip="${ids[1]}"]`))
+    await pop.getByRole('button', { name: 'Open', exact: true }).click()
+    const editor = page.getByRole('dialog')
+    await expect(editor).toBeVisible()
+    await expect(editor.getByRole('button', { name: 'house', exact: true })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    const saved = page.waitForResponse(
+      (r) => r.url().includes(`/api/tasks/${ids[1]}`) && r.request().method() === 'PATCH',
+    )
+    await editor.getByRole('button', { name: 'health', exact: true }).click()
+    await editor.getByRole('button', { name: 'Save' }).click()
+    expect((await saved).status()).toBe(200)
+    await expect(clusterOf(page, ids[1])).toHaveAttribute('data-track-cluster', 'health')
+
+    // A label the registry has never heard of is typed in the same picker and
+    // registered by the save itself (`create_label`), so the new quota has a
+    // cluster of its own the moment it exists.
+    await page.getByRole('button', { name: 'New quota' }).click()
+    const form = page.getByRole('dialog')
+    await form.getByRole('textbox').first().fill('Probe label brand new')
+    await form.getByRole('button', { name: '+ New' }).click()
+    await form.getByRole('textbox', { name: 'New label' }).fill('probe-domain')
+    await form.getByRole('textbox', { name: 'New label' }).press('Enter')
+    await expect(form.getByRole('button', { name: 'probe-domain' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    const created = page.waitForResponse(
+      (r) => r.url().endsWith('/api/tasks') && r.request().method() === 'POST',
+    )
+    await form.getByRole('button', { name: 'Create' }).click()
+    // Made through the UI, so `createTask` never saw it — register it by hand
+    // or the afterEach has nothing to clean up.
+    const newId = (await (await created).json()).data.id as number
+    cleanUpLater(newId)
+    ids.push(newId)
+    await expect(clusterOf(page, newId)).toHaveAttribute('data-track-cluster', 'probe-domain')
+  })
+})
+
+/** Three quotas under two run-unique labels, one of them met at load. */
+async function seedSearchable(page: Page) {
+  const tag = `srch${Date.now()}`
+  const labelA = `zz-${tag}-a`
+  const labelB = `zz-${tag}-b`
+  const zebra = await createTask(page, {
+    title: `${tag} Zebra open`,
+    progress_target: 2,
+    rrule: 'FREQ=WEEKLY',
+    labels: [labelA],
+    create_label: true,
+  })
+  const zebraMet = await createTask(page, {
+    title: `${tag} Zebra met`,
+    progress_target: 1,
+    // A target of 1 is only a quota when it says so.
+    is_tracked: true,
+    rrule: 'FREQ=WEEKLY',
+    labels: [labelA],
+    create_label: true,
+  })
+  const walrus = await createTask(page, {
+    title: `${tag} Walrus`,
+    notes: `okapi-${tag} lives in the notes`,
+    progress_target: 2,
+    rrule: 'FREQ=MONTHLY',
+    labels: [labelB],
+    create_label: true,
+  })
+  expect(
+    (await page.request.post(`/api/tasks/${zebraMet}/progress`, { data: { delta: 1 } })).ok(),
+  ).toBeTruthy()
+  return { tag, labelA, labelB, zebra, zebraMet, walrus }
+}
+
+/**
+ * Search on /quotas (Trent, 2026-09-29: "we need to be able to search quotas on
+ * the quotas screen. There's no search field."). The Reminders page's pattern
+ * and its matcher: title and notes, case-insensitive. Searching narrows what is
+ * rendered and never touches the user's folds or what "Show met" put away, so
+ * clearing it leaves the page exactly as it was.
+ */
+test.describe('Quotas page — search', () => {
+  test('summary: narrows across periods, opens folded clusters, and clearing restores the folds', async ({
+    authenticatedPage: page,
+  }) => {
+    const { tag, labelA, zebra, zebraMet, walrus } = await seedSearchable(page)
+    await page.goto('/quotas')
+    const panel = page.getByRole('region', { name: 'Quotas' })
+    const chip = (id: number) => panel.locator(`[data-track-chip="${id}"]`)
+    const monthly = panel.locator('[data-quota-period="MONTHLY"]')
+    const clusterToggle = panel.locator(
+      `[data-quota-period="WEEKLY"] [data-track-cluster="${labelA}"] button`,
+    )
+
+    await expect(chip(zebra)).toBeVisible()
+    await expect(chip(walrus)).toBeVisible()
+    // Met at load: put away.
+    await expect(chip(zebraMet)).toHaveCount(0)
+
+    // Fold the zebra cluster shut — the state search must not disturb.
+    await clusterToggle.click()
+    await expect(clusterToggle).toHaveAttribute('aria-expanded', 'false')
+    await expect(chip(zebra)).toBeHidden()
+
+    const field = page.getByRole('textbox', { name: 'Search quotas' })
+    await expect(field).toBeVisible()
+    await field.fill(`${tag} zebra`)
+
+    const count = page.locator('[data-search-count]')
+    await expect(count).toHaveAttribute('data-search-count', '2')
+    // A match is never behind a fold, and a met match is not put away.
+    await expect(chip(zebra)).toBeVisible()
+    await expect(chip(zebraMet)).toBeVisible()
+    // The other label's quota is gone, and with it every period that held
+    // no match.
+    await expect(chip(walrus)).toHaveCount(0)
+    await expect(panel.locator('[data-quota-period]')).toHaveCount(1)
+    // A result cannot be folded away: the cluster heading is plain text.
+    await expect(clusterToggle).toHaveCount(0)
+
+    // The chip's editor still opens from a result.
+    const pop = await holdChipOpen(page, chip(zebra))
+    await pop.getByRole('button', { name: 'Open', exact: true }).click()
+    const editor = page.getByRole('dialog')
+    await expect(editor).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(editor).toHaveCount(0)
+    await expect(count).toHaveAttribute('data-search-count', '2')
+
+    // Notes are searched too, matching the Tasks and Reminders pages.
+    await field.fill(`okapi-${tag}`)
+    await expect(count).toHaveAttribute('data-search-count', '1')
+    await expect(chip(walrus)).toBeVisible()
+    await expect(monthly).toBeVisible()
+    await expect(chip(zebra)).toHaveCount(0)
+
+    await field.fill(`nothing matches ${tag}`)
+    await expect(count).toHaveAttribute('data-search-count', '0')
+    await expect(page.getByText('No quota here says that.')).toBeVisible()
+
+    // Clearing restores the page as it was: the fold still shut, the met
+    // quota still put away, everything else back.
+    await page.getByRole('button', { name: 'Clear search' }).click()
+    await expect(count).toHaveCount(0)
+    await expect(chip(walrus)).toBeVisible()
+    await expect(clusterToggle).toHaveAttribute('aria-expanded', 'false')
+    await expect(chip(zebra)).toBeHidden()
+    await expect(chip(zebraMet)).toHaveCount(0)
+
+    // Put the fold back: the fold store is shared by every test.
+    await clusterToggle.click()
+    await expect(clusterToggle).toHaveAttribute('aria-expanded', 'true')
+
+    // Cmd/Ctrl+K focuses the field, as on Tasks and Reminders.
+    await page.locator('[data-quotas-summary] h1').click()
+    await expect(field).not.toBeFocused()
+    await page.keyboard.press('ControlOrMeta+k')
+    await expect(field).toBeFocused()
+  })
+
+  test('the ?quota= deep link still lands, and its chip stays while it matches', async ({
+    authenticatedPage: page,
+  }) => {
+    const { tag, walrus } = await seedSearchable(page)
+    await page.goto(`/quotas?quota=${walrus}`)
+    const chip = page.locator(`[data-track-chip="${walrus}"]`)
+    await expect(chip).toBeVisible()
+    const field = page.getByRole('textbox', { name: 'Search quotas' })
+    await field.fill(`okapi-${tag}`)
+    await expect(page.locator('[data-search-count]')).toHaveAttribute('data-search-count', '1')
+    await expect(chip).toBeVisible()
+  })
+
+  test.describe('on a phone', () => {
+    test.use({ viewport: { width: 375, height: 812 } })
+
+    test('the search icon opens the field and narrows the quotas', async ({
+      authenticatedPage: page,
+    }) => {
+      const { tag, zebra, walrus } = await seedSearchable(page)
+      await page.goto('/quotas')
+      const panel = page.getByRole('region', { name: 'Quotas' })
+      await expect(panel.locator(`[data-track-chip="${walrus}"]`)).toBeVisible()
+      await page.getByRole('button', { name: 'Search', exact: true }).click()
+      const field = page.getByRole('textbox', { name: 'Search quotas' })
+      await expect(field).toBeVisible()
+      await field.fill(`${tag} zebra`)
+      const count = page.locator('[data-search-count]')
+      await expect(count).toHaveAttribute('data-search-count', '2')
+      await expect(panel.locator(`[data-track-chip="${zebra}"]`)).toBeVisible()
+      await expect(panel.locator(`[data-track-chip="${walrus}"]`)).toHaveCount(0)
+      await page.getByRole('button', { name: 'Close search' }).click()
+      await expect(count).toHaveCount(0)
+      await expect(panel.locator(`[data-track-chip="${walrus}"]`)).toBeVisible()
+    })
+  })
+})

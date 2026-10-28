@@ -1,0 +1,443 @@
+'use client'
+
+/**
+ * Settings → Reminder periods (2026-09-24)
+ *
+ * Edit the user's time slots: rename one, change when it starts, add one,
+ * remove one. Copies the Labels section's shape (`LabelEditor` in
+ * settings/LabelsSection.tsx): one row per item with an X at the end, and an add row of
+ * the same shape underneath. The start time is the same native
+ * `<input type="time">` the Snooze section uses for wake/sleep time.
+ *
+ * DELIBERATE DIFFERENCES FROM THE SIBLINGS, and why:
+ * - Edits commit on blur or Enter, not on every change (the wake/sleep inputs
+ *   save on change). Changing a period's start MOVES its reminders and writes
+ *   an undo entry; a time input emits a change for each segment typed, so
+ *   09:00 → 10:30 would otherwise move every reminder to 10:00 and then again
+ *   to 10:30. Escape puts the saved value back.
+ * - Removing has no confirmation dialog (Projects has one). Removal is
+ *   undoable — the server restores the period AND the reminders it moved in
+ *   one undo — so the toast's Undo replaces the dialog, per Trent's "undo over
+ *   confirm". The toast names what the removal changed, the relative targets
+ *   that followed the period included ("5 targets keep 8:30 PM"); a retime's
+ *   toast names the ones that follow it ("5 targets follow").
+ * - The X is absent on the last remaining period rather than disabled: the
+ *   server refuses to remove it, and chrome for an action that cannot happen
+ *   is noise.
+ *
+ * Rows are always listed by start time — that is the order everything else
+ * uses (there is no separate ordering to edit). A row re-sorts once its new
+ * start is saved, never while it is being typed.
+ */
+
+import { useCallback, useRef, useState } from 'react'
+import { X } from 'lucide-react'
+import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
+import { showToast } from '@/lib/toast'
+import { apiFetch, jsonInit } from '@/lib/api-client'
+import { sortSlotsByStart, type TimeSlot } from '@/lib/time-slot-assign'
+import { formatClockTime } from '@/lib/time-utils'
+import { useAnchorTimes } from '@/components/PreferencesProvider'
+
+/**
+ * Same look as the Snooze section's wake/sleep time inputs, but sized: those
+ * sit alone on their rows, so their intrinsic width is fine, while here they
+ * stack in a column. A native time input's intrinsic width follows its value
+ * ("12:00 PM" is wider than "07:00 AM", and the empty add-row input narrower
+ * still), which left each row's time field a few pixels off the one above.
+ * `w-full` fills the fixed grid column below; `h-8` matches the name field,
+ * and `px-2` (not px-3) buys the name field room at phone width.
+ */
+const TIME_INPUT_CLASS =
+  'h-8 w-full rounded-md border border-zinc-200 bg-white px-2 text-sm dark:border-zinc-700 dark:bg-zinc-900'
+
+/**
+ * Every row — each period AND the add row — shares one grid template, so the
+ * name, time and trailing control line up in exact columns. The trailing
+ * column is as wide as the add row's "Add" button; each row's X is centred in
+ * it. 7.75rem fits "12:00 PM" plus Chrome's picker icon. Both fixed columns
+ * are kept tight, and the gap narrows on phones, so a name like "Early
+ * morning" still shows in full at 375px.
+ */
+const ROW_GRID_CLASS = 'grid grid-cols-[minmax(0,1fr)_7.75rem_2.5rem] items-center gap-1.5 sm:gap-2'
+
+interface SlotChange {
+  slot: TimeSlot
+  reminders_moved: number
+  quotas_moved: number
+  /** Settings linked to a removed period, now custom at its start (anchor times). */
+  settings_converted: string[]
+  /**
+   * Relative targets (2026-10-24) linked to the period: a retime's that
+   * followed it (`targets_moved`) and that kept their old time — the new one
+   * would have been after their deadline (`targets_kept`); a removal's, now
+   * custom at its start (`targets_converted`).
+   */
+  targets_moved?: number
+  targets_kept?: number
+  targets_converted?: number
+  undo_id: number | null
+}
+
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? '' : 's'}`
+}
+
+function remindersMoved(n: number): string {
+  return n === 0 ? '' : ` · moved ${plural(n, 'reminder')}`
+}
+
+/** "5 targets follow" / "1 target follows". */
+function targetsFollow(n: number): string {
+  return `${plural(n, 'target')} ${n === 1 ? 'follows' : 'follow'}`
+}
+
+/** "5 targets keep 8:30 PM" / "1 target keeps 8:30 PM". */
+function targetsKeep(n: number, time: string): string {
+  return `${plural(n, 'target')} ${n === 1 ? 'keeps' : 'keep'} ${formatClockTime(time)}`
+}
+
+/**
+ * What a RETIME did to the relative targets that follow the period
+ * (2026-10-24): " · 5 targets follow" and, for the ones the new time would
+ * have put after their deadline (unlinked, at their old time), " · 1 target
+ * keeps 8:30 PM". `oldStart` is the period's start before the change.
+ */
+function retimeTargets(result: SlotChange, oldStart: string): string {
+  const moved = result.targets_moved ?? 0
+  const kept = result.targets_kept ?? 0
+  return (
+    (moved > 0 ? ` · ${targetsFollow(moved)}` : '') +
+    (kept > 0 ? ` · ${targetsKeep(kept, oldStart)}` : '')
+  )
+}
+
+/**
+ * What a removal did besides removing: the reminders and quotas it moved to
+ * the nearest period, and the settings that followed it (Default task time, a pad
+ * button…), which keep its start as their own time — and the relative
+ * targets that followed it, which keep it too (" · 5 targets keep 8:30 PM").
+ */
+function removalSummary(result: SlotChange): string {
+  const moved = [
+    result.reminders_moved > 0 ? plural(result.reminders_moved, 'reminder') : null,
+    result.quotas_moved > 0 ? plural(result.quotas_moved, 'quota') : null,
+  ].filter((p): p is string => p !== null)
+  const kept = result.settings_converted
+  const targets = result.targets_converted ?? 0
+  return (
+    (moved.length > 0 ? ` · moved ${moved.join(', ')}` : '') +
+    (kept.length > 0
+      ? ` · ${kept.join(', ')} ${kept.length === 1 ? 'stays' : 'stay'} at ${formatClockTime(result.slot.start_time)}`
+      : '') +
+    (targets > 0 ? ` · ${targetsKeep(targets, result.slot.start_time)}` : '')
+  )
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error && err.message ? err.message : 'Save failed'
+}
+
+export function TimeSlotSettings({
+  timeSlots,
+  loading,
+  refresh,
+}: {
+  timeSlots: TimeSlot[]
+  loading: boolean
+  refresh: () => Promise<void>
+}) {
+  // The section's one `useTimeSlots()` list (settings/ScheduleSection.tsx),
+  // shared with the Default reminder period picker. Each change re-reads it, so both
+  // show what the server stored.
+  const slots = sortSlotsByStart(timeSlots)
+  // A period change can move the anchor times that follow it (Morning, Wake,
+  // Sleep, pad buttons), so every re-read of the list re-reads them too.
+  const { reloadPreferences } = useAnchorTimes()
+  const load = useCallback(async () => {
+    await Promise.all([refresh(), reloadPreferences()])
+  }, [refresh, reloadPreferences])
+
+  // Undo exactly this change and nothing else. `through_id` alone would also
+  // undo anything done AFTER it (a reminder checked off on the phone in the
+  // meantime), so first confirm this entry is still the newest undoable one;
+  // if it isn't, say so rather than undoing someone else's work. The server
+  // then restores the period with its reminders; re-read the list to show it.
+  const undo = useCallback(
+    async (undoId: number) => {
+      try {
+        const { history } = await apiFetch<{ history: { id: number; undone: boolean }[] }>(
+          '/api/undo/history?limit=20',
+        )
+        if (history.find((e) => !e.undone)?.id !== undoId) {
+          showToast({
+            message: 'Something else changed since — undo it from History instead',
+            type: 'error',
+          })
+          return
+        }
+        await apiFetch('/api/undo/batch', jsonInit('POST', { through_id: undoId }))
+        await load()
+        showToast({ message: 'Undone', type: 'success' })
+      } catch (err) {
+        showToast({ message: errorMessage(err), type: 'error' })
+      }
+    },
+    [load],
+  )
+
+  const toastWithUndo = useCallback(
+    (message: string, undoId: number | null) => {
+      showToast({
+        message,
+        type: 'success',
+        action: undoId === null ? undefined : { label: 'Undo', onClick: () => void undo(undoId) },
+      })
+    },
+    [undo],
+  )
+
+  const update = useCallback(
+    async (slot: TimeSlot, changes: { label?: string; start_time?: string }) => {
+      try {
+        const result = await apiFetch<SlotChange>(
+          `/api/time-slots/${slot.id}`,
+          jsonInit('PATCH', changes),
+        )
+        await load()
+        if (changes.start_time !== undefined) {
+          toastWithUndo(
+            `${result.slot.label} now starts at ${formatClockTime(result.slot.start_time)}` +
+              remindersMoved(result.reminders_moved) +
+              retimeTargets(result, slot.start_time),
+            result.undo_id,
+          )
+        } else {
+          showToast({ message: `Renamed to "${result.slot.label}"`, type: 'success' })
+        }
+        return true
+      } catch (err) {
+        showToast({ message: errorMessage(err), type: 'error' })
+        return false
+      }
+    },
+    [load, toastWithUndo],
+  )
+
+  const remove = useCallback(
+    async (slot: TimeSlot) => {
+      try {
+        const result = await apiFetch<SlotChange>(`/api/time-slots/${slot.id}`, {
+          method: 'DELETE',
+        })
+        await load()
+        toastWithUndo(`Removed "${slot.label}"` + removalSummary(result), result.undo_id)
+      } catch (err) {
+        showToast({ message: errorMessage(err), type: 'error' })
+      }
+    },
+    [load, toastWithUndo],
+  )
+
+  const add = useCallback(
+    async (label: string, startTime: string) => {
+      try {
+        const slot = await apiFetch<TimeSlot>(
+          '/api/time-slots',
+          jsonInit('POST', { label, start_time: startTime }),
+        )
+        await load()
+        showToast({ message: `Added "${slot.label}"`, type: 'success' })
+        return true
+      } catch (err) {
+        showToast({ message: errorMessage(err), type: 'error' })
+        return false
+      }
+    },
+    [load],
+  )
+
+  // Nothing to show until the first read lands — no empty chrome.
+  if (loading) return null
+
+  return (
+    <div className="space-y-2" data-testid="reminder-periods">
+      {slots.map((slot) => (
+        // Keyed by id only: remounting on a save would drop focus from the
+        // field the user just tabbed into. The row resets its own drafts when
+        // the saved values change (see SlotRow).
+        <SlotRow
+          key={slot.id}
+          slot={slot}
+          canRemove={slots.length > 1}
+          onUpdate={(changes) => update(slot, changes)}
+          onRemove={() => void remove(slot)}
+        />
+      ))}
+      <AddSlotRow onAdd={add} />
+    </div>
+  )
+}
+
+function SlotRow({
+  slot,
+  canRemove,
+  onUpdate,
+  onRemove,
+}: {
+  slot: TimeSlot
+  canRemove: boolean
+  onUpdate: (changes: { label?: string; start_time?: string }) => Promise<boolean>
+  onRemove: () => void
+}) {
+  const [label, setLabel] = useState(slot.label)
+  const [time, setTime] = useState(slot.start_time)
+  // When the SAVED value changes (a save, an undo, a re-read), the draft
+  // follows it — adjusted during render, React's pattern for state derived
+  // from a prop, so a field the user is typing in is only reset when what is
+  // stored actually moved.
+  const [savedLabel, setSavedLabel] = useState(slot.label)
+  const [savedTime, setSavedTime] = useState(slot.start_time)
+  if (savedLabel !== slot.label) {
+    setSavedLabel(slot.label)
+    setLabel(slot.label)
+  }
+  if (savedTime !== slot.start_time) {
+    setSavedTime(slot.start_time)
+    setTime(slot.start_time)
+  }
+  // Escape resets the draft and blurs; the blur handler still sees the old
+  // draft in its closure, so this tells it not to commit.
+  const cancelled = useRef(false)
+
+  const commitLabel = async () => {
+    if (cancelled.current) {
+      cancelled.current = false
+      return
+    }
+    const trimmed = label.trim()
+    if (!trimmed || trimmed === slot.label) {
+      setLabel(slot.label)
+      return
+    }
+    if (!(await onUpdate({ label: trimmed }))) setLabel(slot.label)
+  }
+
+  const commitTime = async () => {
+    if (cancelled.current) {
+      cancelled.current = false
+      return
+    }
+    if (!time || time === slot.start_time) {
+      setTime(slot.start_time)
+      return
+    }
+    if (!(await onUpdate({ start_time: time }))) setTime(slot.start_time)
+  }
+
+  // Enter commits (by blurring, so blur stays the one commit path);
+  // Escape puts the saved value back first.
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>, reset: () => void) => {
+    if (e.key === 'Escape') {
+      cancelled.current = true
+      reset()
+    }
+    if (e.key === 'Enter' || e.key === 'Escape') e.currentTarget.blur()
+  }
+
+  return (
+    <div className={ROW_GRID_CLASS} data-slot-row={slot.id}>
+      <Input
+        type="text"
+        value={label}
+        onChange={(e) => setLabel(e.target.value)}
+        onBlur={() => void commitLabel()}
+        onKeyDown={(e) => onKeyDown(e, () => setLabel(slot.label))}
+        maxLength={100}
+        aria-label={`Name of ${slot.label}`}
+        className="h-8 min-w-0 text-sm"
+      />
+      <input
+        type="time"
+        value={time}
+        onChange={(e) => setTime(e.target.value)}
+        onBlur={() => void commitTime()}
+        onKeyDown={(e) => onKeyDown(e, () => setTime(slot.start_time))}
+        aria-label={`Start time of ${slot.label}`}
+        className={TIME_INPUT_CLASS}
+      />
+      {canRemove ? (
+        <button
+          type="button"
+          // Keep focus where it is: a press that blurred a half-edited field
+          // would send its PATCH racing this DELETE (a 404 toast, or a move
+          // and then a removal as two undo entries). The draft is discarded
+          // with the row.
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={onRemove}
+          className="justify-self-center text-zinc-400 transition-colors hover:text-red-500"
+          aria-label={`Remove ${slot.label}`}
+        >
+          <X className="size-4" />
+        </button>
+      ) : (
+        <span aria-hidden />
+      )}
+    </div>
+  )
+}
+
+function AddSlotRow({ onAdd }: { onAdd: (label: string, startTime: string) => Promise<boolean> }) {
+  const [label, setLabel] = useState('')
+  const [time, setTime] = useState('')
+  const [saving, setSaving] = useState(false)
+  const ready = label.trim() !== '' && time !== '' && !saving
+
+  const submit = async () => {
+    if (!ready) return
+    setSaving(true)
+    const added = await onAdd(label.trim(), time)
+    setSaving(false)
+    if (added) {
+      setLabel('')
+      setTime('')
+    }
+  }
+
+  return (
+    <div className={`${ROW_GRID_CLASS} pt-1`}>
+      <Input
+        type="text"
+        value={label}
+        onChange={(e) => setLabel(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') void submit()
+        }}
+        placeholder="New period"
+        maxLength={100}
+        aria-label="New period name"
+        className="h-8 min-w-0 text-sm"
+      />
+      <input
+        type="time"
+        value={time}
+        onChange={(e) => setTime(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') void submit()
+        }}
+        aria-label="New period start time"
+        className={TIME_INPUT_CLASS}
+      />
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={() => void submit()}
+        disabled={!ready}
+        className="h-8 w-full px-0"
+      >
+        Add
+      </Button>
+    </div>
+  )
+}

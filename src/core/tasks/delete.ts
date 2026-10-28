@@ -1,0 +1,179 @@
+/**
+ * Task deletion (soft delete to trash)
+ */
+
+import { autoTargetToLead } from './auto-target-lead'
+import { rederiveOnReopen } from './relative-target'
+import { getDb, withTransaction } from '@/core/db'
+import type { Task } from '@/types'
+import { nowUtc } from '@/core/recurrence'
+import { logAction, createTaskSnapshot } from '@/core/undo'
+import { logActivity } from '@/core/activity'
+import { emitSyncEvent } from '@/lib/sync-events'
+import { dispatchWebhookEvent } from '@/core/webhooks/dispatch'
+import { dismissNotificationsForTasks, syncBadgeCount } from '@/core/notifications/dismiss'
+import { ValidationError } from '@/core/errors'
+import { getTaskById } from './read'
+import { loadTaskForMutation } from './access'
+
+export interface DeleteTaskOptions {
+  userId: number
+  taskId: number
+}
+
+export interface RestoreTaskOptions {
+  userId: number
+  taskId: number
+}
+
+/**
+ * Soft delete a task (move to trash)
+ */
+export function deleteTask(options: DeleteTaskOptions): Task {
+  const { userId, taskId } = options
+
+  const task = loadTaskForMutation(userId, taskId, {
+    trashed: { reject: 'Task is already in trash' },
+  })
+
+  const now = nowUtc()
+
+  // Execute delete and undo log in a transaction
+  const deletedTask = withTransaction((db) => {
+    // Soft delete
+    db.prepare('UPDATE tasks SET deleted_at = ?, updated_at = ? WHERE id = ?').run(now, now, taskId)
+
+    // Log to undo
+    const snapshot = createTaskSnapshot(
+      { id: taskId, title: task.title, deleted_at: null },
+      { id: taskId, title: task.title, deleted_at: now },
+      ['deleted_at'],
+    )
+    logAction(userId, 'delete', `Deleted "${task.title}"`, ['deleted_at'], [snapshot])
+
+    logActivity({
+      userId,
+      taskId,
+      action: 'delete',
+      fields: ['deleted_at'],
+      before: snapshot.before_state,
+      after: snapshot.after_state,
+    })
+
+    // Return updated task
+    const result = getTaskById(taskId)
+    if (!result) {
+      throw new Error('Failed to retrieve deleted task')
+    }
+
+    return result
+  })
+
+  emitSyncEvent(userId)
+  dismissNotificationsForTasks(userId, [taskId])
+  dispatchWebhookEvent(userId, 'task.deleted', { task_id: taskId, title: task.title })
+  return deletedTask
+}
+
+/**
+ * Restore a task from trash
+ */
+export function restoreTask(options: RestoreTaskOptions): Task {
+  const { userId, taskId } = options
+
+  // 'allow': restoring is only for a trashed task — the inverse check follows.
+  const task = loadTaskForMutation(userId, taskId, { trashed: 'allow' })
+
+  // Cannot restore non-trashed task
+  if (!task.deleted_at) {
+    throw new ValidationError('Task is not in trash')
+  }
+
+  const now = nowUtc()
+
+  // Execute restore and undo log in a transaction
+  // A pre-migration automatic target restored (the deadlines page, switch on):
+  // converted in the same write (`autoTargetToLead`). A relative one-off
+  // restored open (2026-10-24) re-derives its target (`rederiveOnReopen`): a
+  // period retime while it was trashed moved only its `target_time`.
+  const conv = task.done
+    ? null
+    : (autoTargetToLead(task) ?? (task.archived_at ? null : rederiveOnReopen(task)))
+  const fields = ['deleted_at', ...(conv?.fields ?? [])]
+  const restoredTask = withTransaction((db) => {
+    // Restore from trash
+    db.prepare(
+      `UPDATE tasks SET deleted_at = NULL, ${conv ? `${conv.sql},` : ''} updated_at = ? WHERE id = ?`,
+    ).run(...(conv ? conv.values : []), now, taskId)
+
+    // Log to undo
+    const snapshot = createTaskSnapshot(
+      { ...conv?.before, id: taskId, title: task.title, deleted_at: task.deleted_at },
+      { ...conv?.after, id: taskId, title: task.title, deleted_at: null },
+      fields,
+    )
+    logAction(userId, 'restore', `Restored "${task.title}"`, fields, [snapshot])
+
+    logActivity({
+      userId,
+      taskId,
+      action: 'restore',
+      fields,
+      before: snapshot.before_state,
+      after: snapshot.after_state,
+    })
+
+    // Return updated task
+    const result = getTaskById(taskId)
+    if (!result) {
+      throw new Error('Failed to retrieve restored task')
+    }
+
+    return result
+  })
+
+  emitSyncEvent(userId)
+  // A restored task that is past due is overdue again, so the app-icon badge
+  // has to count it now rather than at the overdue checker's next change.
+  syncBadgeCount(userId)
+  return restoredTask
+}
+
+/**
+ * Empty trash for a user (permanently delete all trashed tasks)
+ */
+export function emptyTrash(userId: number): number {
+  const db = getDb()
+
+  // Get all trashed tasks owned by this user
+  const trashedTasks = db
+    .prepare(
+      `
+    SELECT tasks.id
+    FROM tasks
+    WHERE tasks.deleted_at IS NOT NULL
+      AND tasks.user_id = ?
+  `,
+    )
+    .all(userId) as { id: number }[]
+
+  if (trashedTasks.length === 0) {
+    return 0
+  }
+
+  // Batch delete all tasks and their related records in a transaction
+  const ids = trashedTasks.map((t) => t.id)
+  const placeholders = ids.map(() => '?').join(',')
+  withTransaction((tx) => {
+    tx.prepare(`DELETE FROM ai_insights_results WHERE task_id IN (${placeholders})`).run(...ids)
+    tx.prepare(`DELETE FROM completions WHERE task_id IN (${placeholders})`).run(...ids)
+    tx.prepare(`DELETE FROM tasks WHERE id IN (${placeholders})`).run(...ids)
+    // Note: undo_log entries referencing these task IDs are intentionally NOT cleaned up.
+    // Task IDs are embedded in the JSON `snapshot` column (not a direct column), so there's
+    // no simple DELETE WHERE task_id IN (...). This is harmless: executeUndo() handles missing
+    // tasks gracefully (the UPDATE is a no-op on non-existent rows), and orphaned entries are
+    // just stale data that don't affect correctness.
+  })
+
+  return trashedTasks.length
+}

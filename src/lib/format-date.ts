@@ -1,0 +1,507 @@
+/**
+ * Timezone-aware date formatting utilities.
+ *
+ * All functions accept a UTC ISO string and a timezone string (IANA, e.g. "America/Chicago").
+ * Formatting uses Intl.DateTimeFormat; parseLocalDatetimeInput uses luxon for the
+ * local → UTC conversion.
+ */
+
+import { DateTime } from 'luxon'
+import {
+  openTaskDayBoundaries,
+  openTaskDayOf,
+  openTaskDaysBetween,
+  type DayBoundaries,
+} from '@/lib/opentask-day'
+import {
+  NIGHT_SUFFIX,
+  capitalized,
+  nightDay,
+  nightDayWords,
+  timedDay,
+  timedWeekday,
+} from '@/lib/night-day'
+
+/**
+ * Whole days from `a` to `b` (negative when `b` is earlier), counted on the
+ * user's OpenTask days ("Day starts at" PR 2, 2026-10-24: everything uses the
+ * OpenTask date — `openTaskDaysBetween`): with the day starting at 3:00 AM,
+ * 01:30 still belongs to the day before. `dayStart` is the user's day
+ * boundary (`useDayStart` in the browser, `dayBoundaryForUser` on the
+ * server); `CALENDAR_DAY_START` counts midnight to midnight. Calendar
+ * arithmetic on the dates, so DST's 23- and 25-hour days are one day each.
+ */
+export function daysBetween(a: Date, b: Date, timezone: string, dayStart: string): number {
+  return openTaskDaysBetween(a, b, timezone, dayStart)
+}
+
+export type { DayBoundaries }
+
+/**
+ * The instants yesterday, today, tomorrow, the day after and a week on START
+ * at, as the user's OpenTask days (`openTaskDayBoundaries` — with a 3:00 AM
+ * day start, "today" at 01:30 began yesterday at 3:00). Every "Today" /
+ * "Tomorrow" label, the Today pill and the due-date filter chips read these.
+ */
+export function getTimezoneDayBoundaries(
+  timezone: string,
+  dayStart: string,
+  now: Date = new Date(),
+): DayBoundaries {
+  return openTaskDayBoundaries(timezone, dayStart, now)
+}
+
+/**
+ * Parse a date at midnight in a given timezone, returning a UTC Date.
+ */
+export function parseInTimezone(year: number, month: number, day: number, timezone: string): Date {
+  // Date.UTC auto-normalizes overflow (e.g. day=32 → next month, day=0 → last day of prev month)
+  const normalized = new Date(Date.UTC(year, month - 1, day, 0, 0, 0))
+  const normY = normalized.getUTCFullYear()
+  const normM = normalized.getUTCMonth() + 1
+  const normD = normalized.getUTCDate()
+
+  // Probe at noon UTC on the target date to discover the timezone offset.
+  // Noon is far enough from midnight that local and UTC are almost always on the
+  // same calendar day, avoiding wrap-around in the offset calculation.
+  const noonUtc = new Date(Date.UTC(normY, normM - 1, normD, 12, 0, 0))
+
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  })
+
+  // Compute offset using full datetime difference (not just hours) to avoid
+  // wrap-around errors when local and UTC dates differ.
+  const offsetMsAt = (instant: Date): number => {
+    const parts = fmt.formatToParts(instant)
+    const get = (type: string) => parseInt(parts.find((p) => p.type === type)?.value ?? '0')
+    const localMs = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'))
+    const utcMs = Date.UTC(
+      instant.getUTCFullYear(),
+      instant.getUTCMonth(),
+      instant.getUTCDate(),
+      instant.getUTCHours(),
+      instant.getUTCMinutes(),
+    )
+    return localMs - utcMs
+  }
+
+  // Step 1: approximate midnight using the offset at noon
+  const noonOffset = offsetMsAt(noonUtc)
+  const midnightAsUtc = new Date(Date.UTC(normY, normM - 1, normD, 0, 0, 0))
+  const approxMidnight = new Date(midnightAsUtc.getTime() - noonOffset)
+
+  // Step 2: verify offset at the approximate midnight itself.
+  // On DST transition days the offset at midnight may differ from noon
+  // (e.g. spring-forward at 2 AM: midnight is still in standard time).
+  const midnightOffset = offsetMsAt(approxMidnight)
+  if (midnightOffset === noonOffset) {
+    return approxMidnight
+  }
+  return new Date(midnightAsUtc.getTime() - midnightOffset)
+}
+
+/**
+ * Full date-time for task detail: "Wed, Jan 5, 2025, 9:00 AM"
+ */
+export function formatDateTime(isoUtc: string, timezone: string): string {
+  const date = new Date(isoUtc)
+  return date.toLocaleString('en-US', {
+    timeZone: timezone,
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  })
+}
+
+export interface DueTimeParts {
+  relative: string // "in 47m", "5:00 PM", "Tomorrow 9:00 AM", "3h ago", etc.
+  absolute?: string // "2:25 PM" — only present when relative is "in X"
+}
+
+/**
+ * Structured due-time data for TaskRow's second line.
+ *
+ * Returns a relative string (always) and an optional absolute string
+ * (only when relative is "in Xm" / "in Xh Ym").
+ */
+export function formatDueTimeParts(
+  isoUtc: string,
+  timezone: string,
+  dayStart: string,
+  now: Date = new Date(),
+): DueTimeParts {
+  const due = new Date(isoUtc)
+  const { yesterdayStart, todayStart, tomorrowStart, nextWeekStart } = getTimezoneDayBoundaries(
+    timezone,
+    dayStart,
+    now,
+  )
+
+  const time = formatTimeInZone(due, timezone)
+
+  // Overdue — due is in the past
+  if (due < now) {
+    return formatOverdue(due, now, todayStart, yesterdayStart, timezone, dayStart, time)
+  }
+
+  // Today, future
+  if (due < tomorrowStart) {
+    return formatTodayFuture(due, now, time)
+  }
+
+  // Tomorrow, then the weekday within 7 days: "Tomorrow 9:00 AM", "Tomorrow
+  // night 1:00 AM", "Thu night 1:00 AM" (L9, `nightDay`) — and the moment's
+  // own weekday where "Tomorrow" would contradict its date (a start after
+  // noon: "Sat 11:30 PM" at Sat 12:30, `nightDayWords`).
+  if (due < nextWeekStart) {
+    const n = nightDay(due, timezone, dayStart, now)
+    return { relative: `${capitalized(nightDayWords(n, false))} ${time}` }
+  }
+
+  // Beyond 7 days
+  const dateStr = due.toLocaleDateString('en-US', {
+    timeZone: timezone,
+    month: 'short',
+    day: 'numeric',
+  })
+  return { relative: `${dateStr} ${time}` }
+}
+
+/**
+ * Overdue format — relative + absolute:
+ *   < 60 min:    "Xm ago"     · "5:00 PM"
+ *   today:       "Xh ago"     · "5:00 PM"
+ *   yesterday:   "yesterday"  · "5:00 PM"
+ *   2–6 days:    "Xd ago"     · "Jan 30 5:00 PM"
+ *   1–4 weeks:   "Xw ago"     · "Jan 15 5:00 PM"
+ *   5+ weeks:    "Xmo ago"    · "Dec 1 5:00 PM"
+ */
+function formatOverdue(
+  due: Date,
+  now: Date,
+  todayStart: Date,
+  yesterdayStart: Date,
+  timezone: string,
+  dayStart: string,
+  time: string,
+): DueTimeParts {
+  const diffMs = now.getTime() - due.getTime()
+  const diffMin = Math.floor(diffMs / 60000)
+
+  // For today/yesterday, absolute is just the time.
+  // For older, absolute includes the date.
+  const dateAndTime = `${due.toLocaleDateString('en-US', { timeZone: timezone, month: 'short', day: 'numeric' })} ${time}`
+
+  // Still today — show minutes or hours
+  if (due >= todayStart) {
+    if (diffMin < 60) {
+      const rel = diffMin < 1 ? 'just now' : `${diffMin}m ago`
+      return { relative: rel, absolute: time }
+    }
+    return { relative: `${Math.floor(diffMin / 60)}h ago`, absolute: time }
+  }
+
+  // Yesterday — "last night" in its night (L9: a Mon 01:00 target read Mon
+  // 10:00 with a 3:00 AM start is Sunday's night), the moment's own weekday
+  // where "yesterday" would contradict its date (`nightDayWords`)
+  if (due >= yesterdayStart) {
+    return { relative: nightDayWords(nightDay(due, timezone, dayStart, now), true), absolute: time }
+  }
+
+  // Days/weeks/months ago (OpenTask days in timezone)
+  const calendarDays = daysBetween(due, now, timezone, dayStart)
+
+  if (calendarDays < 7) {
+    return { relative: `${calendarDays}d ago`, absolute: dateAndTime }
+  }
+
+  const weeks = Math.floor(calendarDays / 7)
+  if (calendarDays < 35) {
+    return { relative: `${weeks}w ago`, absolute: dateAndTime }
+  }
+
+  const months = Math.round(calendarDays / 30)
+  return { relative: `${Math.max(1, months)}mo ago`, absolute: dateAndTime }
+}
+
+function formatTodayFuture(due: Date, now: Date, time: string): DueTimeParts {
+  const diffMin = Math.floor((due.getTime() - now.getTime()) / 60000)
+  const threeHoursMin = 180
+
+  if (diffMin < 1) {
+    return { relative: 'in <1m', absolute: time }
+  }
+
+  if (diffMin < threeHoursMin) {
+    const hours = Math.floor(diffMin / 60)
+    const mins = diffMin % 60
+    let rel: string
+    if (hours === 0) {
+      rel = `in ${mins}m`
+    } else if (mins === 0) {
+      rel = `in ${hours}h`
+    } else {
+      rel = `in ${hours}h ${mins}m`
+    }
+    return { relative: rel, absolute: time }
+  }
+
+  return { relative: time }
+}
+
+function formatTimeInZone(date: Date, timezone: string): string {
+  return date.toLocaleTimeString('en-US', {
+    timeZone: timezone,
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  })
+}
+
+/**
+ * Format the duration between two timestamps as a delta string.
+ *
+ * @param fromMs - Start timestamp in milliseconds
+ * @param toMs - End timestamp in milliseconds
+ * @returns Delta string like "+30m", "+2h", "+1d", "-30m", etc.
+ */
+export function formatDurationDelta(fromMs: number, toMs: number): string {
+  const diffMs = toMs - fromMs
+  const sign = diffMs >= 0 ? '+' : '-'
+  const absDiffMs = Math.abs(diffMs)
+
+  const minutes = Math.floor(absDiffMs / 60000)
+  const hours = Math.floor(minutes / 60)
+  const days = Math.floor(hours / 24)
+  const weeks = Math.floor(days / 7)
+
+  if (weeks >= 1) {
+    return `${sign}${weeks}w`
+  }
+  if (days >= 1) {
+    return `${sign}${days}d`
+  }
+  if (hours >= 1) {
+    const remainingMins = minutes % 60
+    if (remainingMins === 0) {
+      return `${sign}${hours}h`
+    }
+    return `${sign}${hours}h${remainingMins}m`
+  }
+  if (minutes >= 1) {
+    return `${sign}${minutes}m`
+  }
+  return `${sign}0m`
+}
+
+/**
+ * When a quota was last logged, for its "Last: …" line (2026-10-16), in the
+ * user's clock: "today 7:42 AM", "yesterday 7:42 AM", the weekday within the
+ * last week ("Thu 7:42 AM"), and past that the date ("Oct 3, 7:42 AM") — a
+ * bare weekday more than six days back would name the wrong Thursday.
+ */
+export function formatLastLogged(
+  isoUtc: string,
+  timezone: string,
+  dayStart: string,
+  now: Date = new Date(),
+): string {
+  const days = daysBetween(new Date(isoUtc), now, timezone, dayStart)
+  const time = formatTimeInTimezone(isoUtc, timezone)
+  // L9 (`nightDay`): a 1:00 AM log is the night of the OpenTask day before;
+  // with a start after noon, a Sat 23:47 log is "Sat 11:47 PM" (its own
+  // date's weekday), never "today 11:47 PM" on Sunday's list (`nightDayWords`).
+  const n = nightDay(new Date(isoUtc), timezone, dayStart, now)
+  if (days <= 0 && n.gap > 0) return `today ${time}` // a log a moment ahead (clock skew)
+  if (days < 7 && n.dateGap > -7) return `${nightDayWords(n, true)} ${time}`
+  const local = DateTime.fromISO(isoUtc, { zone: timezone })
+  return `${local.toFormat('LLL d')}, ${time}`
+}
+
+/**
+ * A moment's DATE ALONE ("Oct 25"; with `year`, "Oct 25, 2026"), as its
+ * OpenTask date ("OpenTask day everywhere" part 2): a task completed or
+ * deleted at 00:30 with a 3:00 AM day start is the day before's — the day
+ * History groups it under. For the archive's "Completed …", the trash's
+ * "Deleted …" and a quota's "Created". A label with a TIME keeps the moment's
+ * own date (`formatDateTime`).
+ */
+export function openTaskDateLabel(
+  isoUtc: string,
+  timezone: string,
+  dayStart: string,
+  opts: { year?: boolean } = {},
+): string {
+  const date = new Date(isoUtc)
+  if (Number.isNaN(date.getTime())) return '—'
+  const day = DateTime.fromISO(openTaskDayOf(date, timezone, dayStart), { zone: timezone })
+  return day.toFormat(opts.year ? 'LLL d, yyyy' : 'LLL d')
+}
+
+/**
+ * Format a time in a given timezone as "9:00 AM" style.
+ * Exported for use in activity formatting and anywhere a timezone-aware time string is needed.
+ */
+export function formatTimeInTimezone(isoUtc: string, timezone: string): string {
+  return formatTimeInZone(new Date(isoUtc), timezone)
+}
+
+/**
+ * Compact task age for the dashboard TaskRow metadata line.
+ *
+ * Returns a compact "Xd old" string when the anchor is 1+ calendar days old
+ * (in the user's timezone), or null if the anchor is less than 1 day old.
+ *
+ * Anchor dates (chosen by caller):
+ * - One-off tasks: original_due_at ?? created_at (captures deferral time when present)
+ * - Recurring tasks: original_due_at ?? due_at
+ *
+ * Ranges: 1–6d → "Xd old", 7–29d → "Xw old", 30–364d → "Xmo old", 365+ → "Xy old"
+ */
+export function formatTaskAge(
+  anchorIsoUtc: string,
+  timezone: string,
+  dayStart: string,
+  now: Date = new Date(),
+): string | null {
+  const anchor = new Date(anchorIsoUtc)
+
+  if (anchor > now) return null
+
+  const calendarDays = daysBetween(anchor, now, timezone, dayStart)
+
+  if (calendarDays < 1) return null
+
+  if (calendarDays < 7) return `${calendarDays}d old`
+
+  if (calendarDays < 30) {
+    const weeks = Math.floor(calendarDays / 7)
+    return `${weeks}w old`
+  }
+
+  if (calendarDays < 365) {
+    const months = Math.floor(calendarDays / 30)
+    return `${Math.max(1, months)}mo old`
+  }
+
+  const years = Math.floor(calendarDays / 365)
+  return `${years}y old`
+}
+
+/** "2 hours ago", "3 days ago", "4 weeks ago", "2 months ago" — the largest whole unit, at least 1 minute. */
+function formatTimeAgo(anchor: DateTime, now: DateTime): string {
+  const diff = now.diff(anchor, ['months', 'weeks', 'days', 'hours', 'minutes'])
+  if (diff.months >= 1) return plural(Math.floor(diff.months), 'month')
+  if (diff.weeks >= 1) return plural(Math.floor(diff.weeks), 'week')
+  if (diff.days >= 1) return plural(Math.floor(diff.days), 'day')
+  if (diff.hours >= 1) return plural(Math.floor(diff.hours), 'hour')
+  return plural(Math.max(1, Math.floor(diff.minutes)), 'minute')
+}
+
+function plural(n: number, unit: string): string {
+  return `${n} ${unit}${n === 1 ? '' : 's'} ago`
+}
+
+/** The "since X" text on QuickActionPanel's recurrence line (see `formatTaskSince`). */
+export interface TaskSince {
+  /** Compact label after "since": "today", "yesterday", "Mon", "Jan 11", "Dec 20, 2025" */
+  label: string
+  /** Popover line: "2 hours ago", "3 days ago", "4 weeks ago", "2 months ago" */
+  timeAgo: string
+  /** Popover line: the anchor in full, e.g. "Mon, Jan 12, 2026, 9:00 AM" */
+  fullDate: string
+}
+
+/**
+ * Task age for QuickActionPanel's "since X" indicator on the recurrence line.
+ *
+ * Unlike `formatTaskAge` (TaskRow's compact "Xd old"), this returns a label
+ * plus the full date and a relative time for the hover/tap popover.
+ *
+ * For one-off tasks: age is based on original_due_at ?? created_at. When
+ * original_due_at exists, it shows how long since the task was first due
+ * (capturing deferral time). Falls back to created_at for tasks never deferred.
+ * For recurring tasks: age is based on original_due_at ?? due_at (when the
+ * current occurrence was originally due), but only shown when the occurrence
+ * is overdue (the anchor is in the past). If the occurrence hasn't arrived
+ * yet — or a recurring task has no date at all — it returns null.
+ */
+export function formatTaskSince(
+  task: {
+    rrule: string | null
+    due_at: string | null
+    original_due_at: string | null
+    created_at: string
+  },
+  timezone: string,
+  dayStart: string,
+  now: Date = new Date(),
+): TaskSince | null {
+  let anchorIso: string | null
+  if (task.rrule) {
+    anchorIso = task.original_due_at ?? task.due_at
+    if (!anchorIso) return null
+    if (new Date(anchorIso) > now) return null // occurrence hasn't arrived yet
+  } else {
+    anchorIso = task.original_due_at ?? task.created_at
+  }
+
+  const anchor = DateTime.fromISO(anchorIso, { zone: 'utc' }).setZone(timezone)
+  const nowDt = DateTime.fromJSDate(now).setZone(timezone)
+  const fullDate = anchor.toFormat('ccc, LLL d, yyyy, h:mm a')
+
+  const timeAgo = formatTimeAgo(anchor, nowDt)
+
+  // "today" / "yesterday" by OpenTask day (`daysBetween`), with L9's "night"
+  // for a moment in its night (`nightDay`) — else the day of the anchor's
+  // own date, the one `fullDate` shows (`timedDay`: a start after noon).
+  const days = daysBetween(anchor.toJSDate(), now, timezone, dayStart)
+  const n = nightDay(anchor.toJSDate(), timezone, dayStart, now)
+  let label: string
+  if (days === 0 || days === 1) {
+    label = nightDayWords(n, true)
+  } else if (nowDt.diff(anchor, 'days').days < 7) {
+    label = timedWeekday(n)
+  } else {
+    // The date, "night" in its night (the chip's "Oct 30 night").
+    const day = timedDay(n)
+    const date = day.toFormat(day.year === nowDt.year ? 'LLL d' : 'LLL d, yyyy')
+    label = n.night ? `${date}${NIGHT_SUFFIX}` : date
+  }
+
+  return { label, timeAgo, fullDate }
+}
+
+/**
+ * Convert a local wall-clock "YYYY-MM-DDTHH:mm" in `timezone` to a UTC ISO string.
+ *
+ * Luxon resolves the zone offset for that exact local date and time, so the
+ * result is right on either side of midnight and across DST. (An earlier
+ * version derived the offset from the hour/minute difference alone and landed
+ * a day off whenever UTC and local time fell on different calendar days.)
+ * A time inside a spring-forward gap (2:30 AM on the change day) moves forward
+ * by the gap, to 3:30 AM.
+ */
+export function parseLocalDatetimeInput(value: string, timezone: string): string {
+  const [datePart, timePart] = value.split('T')
+  const [year, month, day] = datePart.split('-').map(Number)
+  const [hour, minute] = timePart.split(':').map(Number)
+
+  const iso = DateTime.fromObject({ year, month, day, hour, minute }, { zone: timezone })
+    .toUTC()
+    .toISO()
+  if (!iso) throw new Error(`Invalid local date-time "${value}" in ${timezone}`)
+  return iso
+}

@@ -1,0 +1,936 @@
+import {
+  test,
+  expect,
+  backdateCreated,
+  openTaskDay,
+  uniqueTitle,
+  waitForPreferenceSave,
+  waitForPrefsLoaded,
+  withPreferences,
+} from './fixtures'
+import type { Page } from '@playwright/test'
+import { DateTime } from 'luxon'
+
+/**
+ * The seeded test user's timezone — slot assignment is done in local time.
+ * Must track `globalSetup.ts`'s `E2E_TZ` override (default America/Chicago):
+ * "today" is the app's today in the user's zone, so a time built in any other
+ * zone lands on the wrong side of midnight whenever the two disagree.
+ */
+const TEST_TZ = process.env.E2E_TZ || 'America/Chicago'
+
+const filtersToggle = (page: Page) => page.getByRole('button', { name: /^Filters/ })
+
+/**
+ * Load the dashboard with the filter section open, and prove the page has
+ * APPLIED the server's preferences before anything is clicked.
+ *
+ * `filters_expanded` is a server preference, and `PreferencesProvider` writes
+ * the loaded value over its local state on mount. A click that beat that load
+ * was undone by it — the chips closed again, while the click's PATCH had
+ * already saved the opposite value for the next test to inherit (the filter
+ * badge and chip pill tests, flaky until 2026-09-25).
+ *
+ * Open is the NON-default value (local state starts `false`), so the toggle
+ * reading `aria-expanded="true"` can only be the load's doing: that assertion
+ * is the proof, not a timing guess. A test that needs the section closed
+ * closes it by hand afterwards, with no load left in flight to undo it.
+ */
+async function loadWithFiltersOpen(page: Page): Promise<void> {
+  const written = await page.request.patch('/api/user/preferences', {
+    data: { filters_expanded: true },
+  })
+  expect(written.ok()).toBeTruthy()
+  await waitForPrefsLoaded(page, () => page.reload(), filtersToggle(page))
+  await expect(filtersToggle(page)).toHaveAttribute('aria-expanded', 'true')
+  await expect(page.locator('#dashboard-filter-chips')).toBeVisible()
+}
+
+/**
+ * Click the filter toggle and wait for the PATCH that saves it, so no test
+ * ends with a keepalive save still in flight for the next one to race.
+ */
+async function clickFiltersToggle(page: Page): Promise<void> {
+  const saved = waitForPreferenceSave(page, 'filters_expanded')
+  await filtersToggle(page).click()
+  await saved
+}
+
+test.describe('Dashboard', () => {
+  test('tasks are displayed on the dashboard', async ({ authenticatedPage: page }) => {
+    await withPreferences(page, { default_grouping: 'project' }, async () => {
+      // Now shows the seeded task that is over target...
+      const overdue = page.getByText('Reply to email')
+      await waitForPrefsLoaded(page, () => page.goto('/'), overdue)
+      await expect(overdue).toBeVisible()
+      // ...and Show all every other seeded task (they are due later, so in Now
+      // they sit behind their projects' folds).
+      await page
+        .locator('[data-now-summary]')
+        .getByRole('button', { name: /^Show all \d+$/ })
+        .click()
+      await expect(page.getByText('Buy groceries')).toBeVisible()
+      await expect(page.getByText('Morning routine')).toBeVisible()
+    })
+  })
+
+  test('the nav carries the top bar\u2019s overdue and today numbers', async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const bar = page.getByRole('group', { name: 'Task counts' })
+    await expect(bar).toBeVisible()
+    const nav = page.locator('aside [data-tasks-badge]')
+    await expect(nav).toBeVisible()
+    // The bar shows total, overdue (if any), today (if any); the nav shows the
+    // last two. Same numbers, same order.
+    const barPills = (await bar.innerText()).trim().split(/\s+/)
+    const navPills = (await nav.innerText()).trim().split(/\s+/)
+    expect(navPills.length).toBeGreaterThan(0)
+    expect(barPills.slice(-navPills.length)).toEqual(navPills)
+
+    // And it is there on a page that never loads the task list.
+    await page.getByRole('link', { name: 'Reminders' }).click()
+    await page.waitForURL('/reminders')
+    await expect(page.locator('aside [data-tasks-badge]')).toHaveText(navPills.join(''))
+  })
+
+  test('each nav badge opens the dashboard filtered to exactly those tasks', async ({
+    authenticatedPage: page,
+  }) => {
+    // 2026-10-27, Trent: the sidebar's purple (overdue) and grey (today)
+    // numbers are links to the top bar pills' filter — on the dashboard and
+    // from any other page (src/lib/nav-filter.ts). A badge never clears it.
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const ids: number[] = []
+    const make = async (title: string, due_at: string) => {
+      const res = await page.request.post('/api/tasks', { data: { title, due_at } })
+      ids.push((await res.json()).data.id as number)
+    }
+    try {
+      await make(uniqueTitle('Badge overdue'), new Date(Date.now() - 26 * 3600_000).toISOString())
+      // Later today on the OpenTask day, whatever the hour: two minutes before
+      // the day ends (the next day's start), never past and never tomorrow's.
+      const tz = process.env.E2E_TZ || 'America/Chicago'
+      const prefs = (await (await page.request.get('/api/user/preferences')).json()).data as {
+        rollover_time: string
+      }
+      const dayEnd = DateTime.fromISO(`${await openTaskDay(page, 1)}T${prefs.rollover_time}`, {
+        zone: tz,
+      })
+      await make(uniqueTitle('Badge today'), dayEnd.minus({ minutes: 2 }).toUTC().toISO()!)
+      await page.goto('/reminders')
+      const badge = (filter: string) => page.locator(`aside [data-tasks-badge-filter="${filter}"]`)
+      const todayPill = page.getByRole('button', { name: /for today — clear the today filter/ })
+      const overdueChip = page.locator('[data-pinned-date-chip="overdue"]')
+
+      // From another page: Today's badge lands on the dashboard, today only.
+      await expect(badge('today')).toHaveAttribute('aria-label', /^Show \d+ for today$/)
+      await badge('today').click()
+      await page.waitForURL('/')
+      await expect(todayPill).toBeVisible()
+
+      // On the dashboard: Overdue's badge swaps the filter to overdue only.
+      await badge('overdue').click()
+      await expect(overdueChip).toHaveAttribute('aria-pressed', 'true')
+      await expect(todayPill).toHaveCount(0)
+      // A second click keeps it on (a badge never clears the filter).
+      await badge('overdue').click()
+      await expect(overdueChip).toHaveAttribute('aria-pressed', 'true')
+    } finally {
+      if (ids.length) await page.request.post('/api/tasks/bulk/delete', { data: { ids } })
+    }
+  })
+})
+
+/**
+ * Now (2026-10-14): a one-off with no date and no High/Urgent priority is not
+ * relevant now, so it sits behind its project's "+ N more" fold. Adding one
+ * from the quick add does NOT open the fold — the Just now card lists it, and
+ * the card's tap opens the fold to show the real row. (Until 2026-10-14 the
+ * Today view had an "Undated" pile that an add opened instead.)
+ */
+async function taskIdByTitle(page: Page, title: string): Promise<number | null> {
+  const res = await page.request.get(`/api/tasks?search=${encodeURIComponent(title)}`)
+  const tasks = (await res.json()).data.tasks as { id: number; title: string }[]
+  return tasks.find((t) => t.title === title)?.id ?? null
+}
+
+test.describe('Now: a dateless task lands behind the fold', () => {
+  test('quick add lists it in the Just now card; the tap opens its fold', async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const title = uniqueTitle('Another dateless thought')
+    await withPreferences(page, { default_grouping: 'project' }, async () => {
+      let id: number | null = null
+      try {
+        const add = page.getByRole('textbox', { name: 'Quick add task' })
+        await waitForPrefsLoaded(page, () => page.goto('/'), add)
+        await add.fill(title)
+        await page.keyboard.press('Enter')
+        const list = page.getByRole('listbox', { name: 'Task list' })
+        await expect.poll(() => taskIdByTitle(page, title)).not.toBeNull()
+        id = await taskIdByTitle(page, title)
+        const entry = page.locator(`[data-just-added-entry="${id}"]`)
+        await expect(entry).toBeVisible()
+        await expect(list.locator(`#task-row-${id}`)).toHaveCount(0)
+        await entry.click()
+        await expect(list.locator(`#task-row-${id}`)).toBeVisible()
+        await expect(page.getByRole('button', { name: 'Show fewer' }).first()).toBeVisible()
+      } finally {
+        if (id !== null) await page.request.delete(`/api/tasks/${id}`)
+      }
+    })
+  })
+})
+
+/**
+ * REDESIGN-V03 §7.3 — the filter chips collapse behind one control so the front
+ * door shows tasks, not a wall of chips. The collapse rules themselves are
+ * documented in src/hooks/useFilterSection.ts.
+ */
+/**
+ * Run `run` with two tasks of the test's own in two different date buckets —
+ * one with no target ("No Target") and one targeted weeks ahead — trashed
+ * afterwards.
+ *
+ * The date chips only show when at least two buckets have tasks
+ * (`DueDateFilterBar`), and which buckets the seeded tasks fill depends on
+ * the hour of the run (they are dated relative to it): just after midnight
+ * they can all fall in one, and the section had chips only because an earlier
+ * spec's quick-added task was left behind in "No Target" (until 2026-10-17).
+ * Backdated so neither is a "Just added" preview or a task-segment row.
+ */
+async function withTwoDateBuckets(page: Page, run: () => Promise<void>): Promise<void> {
+  const ids: number[] = []
+  const later = DateTime.now()
+    .setZone(TEST_TZ)
+    .plus({ days: 40 })
+    .set({ hour: 9, minute: 0, second: 0, millisecond: 0 })
+    .toUTC()
+    .toISO()
+  for (const data of [
+    { title: uniqueTitle('Filter undated') },
+    { title: uniqueTitle('Filter later'), due_at: later },
+  ]) {
+    const res = await page.request.post('/api/tasks', { data })
+    expect(res.ok()).toBeTruthy()
+    ids.push((await res.json()).data.id as number)
+  }
+  backdateCreated(ids)
+  try {
+    await run()
+  } finally {
+    for (const id of ids) await page.request.delete(`/api/tasks/${id}`)
+  }
+}
+
+test.describe('Dashboard filter section', () => {
+  const toggle = filtersToggle
+
+  test('filter chips are collapsed by default and open in one click', async ({
+    authenticatedPage: page,
+  }) => {
+    await withTwoDateBuckets(page, async () => {
+      // ESTABLISH THE PRECONDITION RATHER THAN INHERIT IT. `filters_expanded` is
+      // a server preference on the one user every spec in the run shares, so
+      // "collapsed by default" is only true here if nothing earlier in the run
+      // pinned it open — which made this test a hostage to file ordering, and it
+      // duly broke the first time a new spec sorted ahead of it.
+      //
+      // Every click below lands after a load the page has provably applied (see
+      // `loadWithFiltersOpen`): starting from "open" is what makes the load
+      // observable, since closed is also the pre-load default.
+      await loadWithFiltersOpen(page)
+      const chips = page.locator('#dashboard-filter-chips')
+
+      // Closed by hand: client and server now both hold `false`.
+      await clickFiltersToggle(page)
+      await expect(toggle(page)).toHaveAttribute('aria-expanded', 'false')
+      await expect(chips).toHaveCount(0)
+
+      // One click opens it.
+      await clickFiltersToggle(page)
+      await expect(chips).toBeVisible()
+      await expect(toggle(page)).toHaveAttribute('aria-expanded', 'true')
+      // The chips the section hides are really there once opened
+      await expect(chips.locator('[data-date-chip]').first()).toBeVisible()
+
+      // ...and close again
+      await clickFiltersToggle(page)
+      await expect(chips).toHaveCount(0)
+
+      // Collapsed by default: a fresh load with the preference off stays shut.
+      await waitForPrefsLoaded(page, () => page.reload(), toggle(page))
+      await expect(toggle(page)).toHaveAttribute('aria-expanded', 'false')
+      await expect(chips).toHaveCount(0)
+    })
+  })
+
+  test('applying a filter shows a count badge on the collapsed control', async ({
+    authenticatedPage: page,
+  }) => {
+    await withTwoDateBuckets(page, async () => {
+      await loadWithFiltersOpen(page)
+      const chips = page.locator('#dashboard-filter-chips')
+      await chips.locator('[data-date-chip]').first().click()
+
+      // Filter applied: the list is narrowed and the control carries the count
+      await expect(page.getByText(/Showing \d+ of \d+ tasks/)).toBeVisible()
+      await expect(toggle(page)).toContainText('1')
+
+      // Collapsing by hand keeps the active filter legible via the badge
+      await clickFiltersToggle(page)
+      await expect(page.locator('#dashboard-filter-chips')).toHaveCount(0)
+      await expect(toggle(page)).toContainText('1')
+    })
+  })
+
+  test('clearing every filter drops the badge and lets the section stay closed', async ({
+    authenticatedPage: page,
+  }) => {
+    await withTwoDateBuckets(page, async () => {
+      await loadWithFiltersOpen(page)
+      const chips = page.locator('#dashboard-filter-chips')
+      await chips.locator('[data-date-chip]').first().click()
+      await expect(toggle(page)).toContainText('1')
+
+      await page.getByRole('button', { name: 'Clear filter' }).click()
+
+      await expect(page.getByText(/Showing \d+ of \d+ tasks/)).toHaveCount(0)
+      await expect(toggle(page)).toHaveText('Filters')
+      // Auto-expand released, so the toggle is free to close again
+      await clickFiltersToggle(page)
+      await expect(page.locator('#dashboard-filter-chips')).toHaveCount(0)
+    })
+  })
+})
+
+/**
+ * `?filter=overdue` — the Tasks widget's header link while it shows its
+ * Overdue page (`opentask://overdue`), and the overdue Web Push. It seeds the
+ * ordinary Overdue date chip (not a parallel filter), applies once, and is
+ * stripped from the URL so a reload after "Clear filter" stays cleared.
+ * Since 2026-09-26 the chip section stays shut for it: the pinned Overdue chip
+ * in the control row shows the filter (see overdue-chip.spec.ts).
+ * See `DashboardClient.tsx`'s `?filter=` handling.
+ */
+test.describe('?filter=overdue deep link', () => {
+  test('opens the dashboard filtered to Overdue, visibly, and clears for good', async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    // ESTABLISH THE PRECONDITION RATHER THAN INHERIT IT — see the filter
+    // section tests above. Collapsed chips prove the link opens them itself.
+    const written = await page.request.patch('/api/user/preferences', {
+      data: { filters_expanded: false },
+    })
+    expect(written.ok()).toBeTruthy()
+
+    const ids: number[] = []
+    try {
+      for (const body of [
+        {
+          title: 'Overdue deep-link task',
+          due_at: new Date(Date.now() - 30 * 24 * 3600_000).toISOString(),
+        },
+        {
+          title: 'Not-yet-due deep-link task',
+          due_at: new Date(Date.now() + 3600_000).toISOString(),
+        },
+      ]) {
+        const res = await page.request.post('/api/tasks', { data: body })
+        expect(res.ok()).toBeTruthy()
+        ids.push((await res.json()).data.id as number)
+      }
+      const [overdueId, upcomingId] = ids
+
+      await page.goto('/?filter=overdue')
+
+      // Visibly on: the pinned Overdue chip is selected (the chip section
+      // stays shut — the pinned chip is the visible state), and the banner
+      // says the list is narrowed.
+      await expect(page.locator('[data-pinned-date-chip="overdue"]')).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      )
+      await expect(page.locator('#dashboard-filter-chips')).toHaveCount(0)
+      await expect(page.getByText(/Showing \d+ of \d+ tasks/)).toBeVisible()
+      await expect(page.getByRole('button', { name: /^Filters/ })).toContainText('1')
+      await expect(page.locator(`#task-row-${overdueId}`)).toBeVisible()
+      await expect(page.locator(`#task-row-${upcomingId}`)).toHaveCount(0)
+      // The param is spent.
+      await expect(page).toHaveURL('/')
+
+      // Easy to clear, and clearing sticks — nothing re-applies it.
+      await page.getByRole('button', { name: 'Clear filter' }).click()
+      await expect(page.getByText(/Showing \d+ of \d+ tasks/)).toHaveCount(0)
+      await expect(page.locator('#dashboard-filter-chips')).toHaveCount(0)
+      await page.reload()
+      await expect(page.getByRole('button', { name: /^Filters/ })).toHaveText('Filters')
+      await expect(page.getByText(/Showing \d+ of \d+ tasks/)).toHaveCount(0)
+      await expect(page.locator('#dashboard-filter-chips')).toHaveCount(0)
+    } finally {
+      for (const id of ids) await page.request.delete(`/api/tasks/${id}`)
+    }
+  })
+})
+
+/**
+ * `?task=<id>` has two shapes sharing one URL: the widget's deep link adds
+ * `&highlight=1` and brings the row into view without opening it (mirrors
+ * `/reminders?reminder=<id>`); the bare param — a notification tap, native or
+ * Web Push — brings it into view AND selects it, still opening nothing
+ * (Trent, 2026-09-29; it used to open the quick panel). See
+ * `DashboardClient.tsx`'s `?task=` effect and `src/lib/task-link.ts`.
+ */
+test.describe('?task=<id> deep link', () => {
+  async function createTask(page: Page, body: Record<string, unknown>): Promise<number> {
+    const res = await page.request.post('/api/tasks', { data: body })
+    expect(res.ok()).toBeTruthy()
+    return (await res.json()).data.id as number
+  }
+
+  async function deleteTasks(page: Page, ids: number[]): Promise<void> {
+    for (const id of ids) await page.request.delete(`/api/tasks/${id}`)
+  }
+
+  // ESTABLISH THE PRECONDITION RATHER THAN INHERIT IT — see the filter
+  // section tests above: `default_grouping` is a server preference on the one
+  // test user every spec in the run shares, so "a project group exists to find
+  // the row in" is only true here if nothing earlier in the run left it on
+  // New/Unified. Restored in `finally`. Now (`'project'`) folds what isn't
+  // relevant now behind each project's "+ N more", so these also cover a
+  // link to a row behind a shut fold.
+  async function withGrouping(
+    page: Page,
+    grouping: 'project',
+    run: () => Promise<void>,
+  ): Promise<void> {
+    const before = (await (await page.request.get('/api/user/preferences')).json()).data
+      .default_grouping as string
+    const written = await page.request.patch('/api/user/preferences', {
+      data: { default_grouping: grouping },
+    })
+    expect(written.ok()).toBeTruthy()
+    try {
+      await run()
+    } finally {
+      await page.request.patch('/api/user/preferences', { data: { default_grouping: before } })
+    }
+  }
+  const withAllGrouping = (page: Page, run: () => Promise<void>) =>
+    withGrouping(page, 'project', run)
+
+  test('&highlight=1 brings the row into view without selecting it', async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const ids: number[] = []
+    await withAllGrouping(page, async () => {
+      try {
+        const id = await createTask(page, {
+          title: 'A task the widget links to',
+          due_at: new Date(Date.now() + 3600_000).toISOString(),
+        })
+        ids.push(id)
+
+        // The widget's link: brought on screen and flashed once; nothing opens.
+        await page.goto(`/?task=${id}&highlight=1`)
+        const row = page.locator(`#task-row-${id}`)
+        await expect(row).toHaveAttribute('data-task-highlight', '')
+        await expect(row).toBeInViewport()
+        await expect(page.getByRole('dialog')).toHaveCount(0)
+        // The widget's tap is "show me", not "act on it": nothing selected.
+        await expect(row).toHaveAttribute('aria-selected', 'false')
+        await expect(page.getByRole('button', { name: 'Clear selection' })).toHaveCount(0)
+        // The param is spent, so a reload does not flash the same row again.
+        await expect(page).toHaveURL('/')
+      } finally {
+        await deleteTasks(page, ids)
+      }
+    })
+  })
+
+  test("&highlight=1 opens the project's Now fold to reach the row (undated)", async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const ids: number[] = []
+    await withAllGrouping(page, async () => {
+      try {
+        const id = await createTask(page, { title: 'An undated task the widget links to' })
+        ids.push(id)
+
+        await page.goto(`/?task=${id}&highlight=1`)
+        const row = page.locator(`#task-row-${id}`)
+        await expect(row).toHaveAttribute('data-task-highlight', '')
+        await expect(row).toBeInViewport()
+        await expect(page.getByRole('dialog')).toHaveCount(0)
+      } finally {
+        await deleteTasks(page, ids)
+      }
+    })
+  })
+
+  // THE NOTIFICATION TAP — the bare `/?task=<id>` that the iPhone and Mac apps
+  // (`DeepLinkRouter.notificationTaskPath`) and every Web Push load.
+  async function expectSelectedAndShown(page: Page, id: number): Promise<void> {
+    const row = page.locator(`#task-row-${id}`)
+    await expect(row).toHaveAttribute('aria-selected', 'true')
+    await expect(row).toBeInViewport()
+    // The action bar is up for it...
+    await expect(page.getByRole('button', { name: 'Clear selection' })).toBeVisible()
+    // ...and nothing opened over the list.
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+    await expect(page).toHaveURL('/')
+  }
+
+  test('a notification tap selects the row and opens nothing', async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const ids: number[] = []
+    await withAllGrouping(page, async () => {
+      try {
+        const id = await createTask(page, {
+          title: 'A task a notification links to',
+          due_at: new Date(Date.now() - 3600_000).toISOString(),
+        })
+        ids.push(id)
+
+        await page.goto(`/?task=${id}`)
+        await expectSelectedAndShown(page, id)
+        await expect(page.locator(`#task-row-${id}`)).toHaveAttribute('data-task-highlight', '')
+      } finally {
+        await deleteTasks(page, ids)
+      }
+    })
+  })
+
+  test("a notification tap opens the project's Now fold to select the row (undated)", async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const ids: number[] = []
+    await withAllGrouping(page, async () => {
+      try {
+        const id = await createTask(page, { title: 'An undated task a notification links to' })
+        ids.push(id)
+
+        await page.goto(`/?task=${id}`)
+        await expectSelectedAndShown(page, id)
+      } finally {
+        await deleteTasks(page, ids)
+      }
+    })
+  })
+
+  test('a notification tap on a task due next week opens its fold, and the view stays Now', async ({
+    authenticatedPage: page,
+  }) => {
+    // The "AI finished" case: a task just added for next week is not relevant
+    // now, so its row is behind its project's fold. The tap opens the fold and
+    // selects the row; the saved view is untouched. (Until 2026-10-14 the
+    // Today view had no row for it, and the tap switched the visit to All.)
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const ids: number[] = []
+    await withAllGrouping(page, async () => {
+      try {
+        const nextWeek = DateTime.now().setZone(TEST_TZ).plus({ days: 7 }).set({ hour: 9 })
+        const id = await createTask(page, {
+          title: 'Call the dentist next week',
+          due_at: nextWeek.toUTC().toISO(),
+        })
+        ids.push(id)
+
+        await page.goto(`/?task=${id}`)
+        await expectSelectedAndShown(page, id)
+        const saved = (await (await page.request.get('/api/user/preferences')).json()).data
+        expect(saved.default_grouping).toBe('project')
+      } finally {
+        await deleteTasks(page, ids)
+      }
+    })
+  })
+
+  test('a notification tap on a task that is gone says so in a toast', async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const id = await createTask(page, { title: 'A task deleted before the tap' })
+    await page.request.delete(`/api/tasks/${id}`)
+
+    await page.goto(`/?task=${id}`)
+    await expect(page.getByText('“A task deleted before the tap” is in the trash')).toBeVisible()
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Clear selection' })).toHaveCount(0)
+    await expect(page).toHaveURL('/')
+
+    await page.goto('/?task=987654321')
+    await expect(page.getByText('That task no longer exists')).toBeVisible()
+  })
+
+  test('a notification tap on a reminder selects it on the Reminders surface', async ({
+    authenticatedPage: page,
+  }) => {
+    // The "AI finished" push fires for a new reminder too, and it links to
+    // the same `/?task=<id>`; a reminder is never a dashboard row (§6).
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const res = await page.request.post('/api/tasks', {
+      data: {
+        is_reminder: true,
+        title: 'A reminder a notification links to',
+        rrule: 'FREQ=DAILY;BYHOUR=7;BYMINUTE=0',
+        due_at: DateTime.now().setZone(TEST_TZ).set({ hour: 7, minute: 0 }).toUTC().toISO(),
+      },
+    })
+    expect(res.ok()).toBeTruthy()
+    const id = (await res.json()).data.id as number
+    try {
+      await page.goto(`/?task=${id}`)
+      await expect(page).toHaveURL('/reminders')
+      const row = page.locator(`li[data-reminder-id="${id}"]`)
+      await expect(row).toHaveAttribute('aria-selected', 'true')
+      await expect(row).toBeInViewport()
+      await expect(page.getByRole('dialog')).toHaveCount(0)
+    } finally {
+      await deleteTasks(page, [id])
+    }
+  })
+})
+
+/**
+ * Faceted filter counts (Trent 2026-09-23): a filter row's chips must count
+ * over every OTHER active filter group, not the whole corpus — otherwise the
+ * "Work" project filter active still shows "Today N" even though Work has
+ * nothing due today. See `applyTaskFilters` (src/hooks/useFilterState.ts) and
+ * its behavioral test (tests/behavioral/filter-facets.test.ts) for the pure
+ * logic; this reproduces the same scenario end-to-end.
+ */
+test.describe('Dashboard filter facets', () => {
+  async function createTask(page: Page, body: Record<string, unknown>): Promise<number> {
+    const res = await page.request.post('/api/tasks', { data: body })
+    expect(res.ok()).toBeTruthy()
+    return (await res.json()).data.id as number
+  }
+
+  async function deleteTasks(page: Page, ids: number[]): Promise<void> {
+    for (const id of ids) await page.request.delete(`/api/tasks/${id}`)
+  }
+
+  test("a project filter narrows the Today chip's count to that project", async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const ids: number[] = []
+    const todayAt = (hour: number) =>
+      DateTime.now()
+        .setZone(TEST_TZ)
+        .set({ hour, minute: 0, second: 0, millisecond: 0 })
+        .toUTC()
+        .toISO()!
+
+    await loadWithFiltersOpen(page)
+    const chips = page.locator('#dashboard-filter-chips')
+    const todayChip = chips.locator('[data-date-chip="today"]')
+    const workChip = chips.locator('[data-project-chip="3"]')
+    // A chip whose facet count is 0 (and isn't itself selected/excluded)
+    // doesn't render at all — correct faceting (see DueDateFilterBar), and
+    // exactly what should happen to the Today chip once Work is selected if
+    // Work has nothing due today. Treat "not present" as a count of 0 rather
+    // than waiting for an element that may legitimately never appear.
+    const countOf = async (chip: typeof todayChip) => {
+      if ((await chip.count()) === 0) return 0
+      const text = (await chip.innerText()).trim()
+      // The chip's own total is the FIRST number (label, then total, then
+      // optionally a due-today/overdue pill — feat/chip-due-badges) — not the
+      // last, now that a chip with something due today or overdue renders
+      // trailing pill numbers after its total.
+      const match = text.match(/(\d+)/)
+      return match ? Number(match[1]) : NaN
+    }
+
+    // "Clear filter" (not re-clicking the chip) restores the unfiltered
+    // state below: the chip's own interaction model treats two clicks within
+    // 300ms as a double-click (toggles EXCLUDE, not deselect — see
+    // useChipInteraction.ts), which a select-then-immediately-deselect from
+    // a test can trip.
+    const clearFilter = page.getByRole('button', { name: 'Clear filter' })
+
+    // Read baselines first rather than assume a pristine corpus, so this test
+    // stays correct however the seed evolves, rather than hardcoding
+    // "today = 3". The baseline may legitimately be 0 — and the Today chip
+    // then absent: the seed's one due-today task (globalSetup.ts's "Reply to
+    // email", due two hours before the seed ran) falls on YESTERDAY when the
+    // suite starts in the first two hours of the day. So the chips' arrival is
+    // awaited through the Work chip (Work always has seeded open tasks), never
+    // through the Today chip.
+    await expect(workChip).toBeVisible()
+    const baselineToday = await countOf(todayChip)
+    await workChip.click() // select Work exclusively, facet Today over it
+    await expect(clearFilter).toBeVisible() // the filter has applied
+    const baselineWorkToday = await countOf(todayChip)
+    await clearFilter.click() // back to unfiltered
+    await expect(clearFilter).toBeHidden()
+
+    try {
+      // Project 1 = Inbox, 3 = Work (scripts/seed-test.ts / globalSetup.ts).
+      // Two due-today in Inbox, one due-today in Work.
+      ids.push(
+        await createTask(page, {
+          title: 'Facet test — Inbox today A',
+          project_id: 1,
+          due_at: todayAt(23),
+        }),
+      )
+      ids.push(
+        await createTask(page, {
+          title: 'Facet test — Inbox today B',
+          project_id: 1,
+          due_at: todayAt(22),
+        }),
+      )
+      ids.push(
+        await createTask(page, {
+          title: 'Facet test — Work today',
+          project_id: 3,
+          due_at: todayAt(21),
+        }),
+      )
+
+      await loadWithFiltersOpen(page)
+
+      // Unfiltered: baseline plus all 3 newly created "today" tasks.
+      await expect.poll(() => countOf(todayChip)).toBe(baselineToday + 3)
+
+      // Select the Work project chip — the Today row must now facet over
+      // "everything else applies, dateFilters skipped", i.e. Work only.
+      await expect(workChip).toBeVisible()
+      await workChip.click()
+
+      await expect.poll(() => countOf(todayChip)).toBe(baselineWorkToday + 1)
+
+      // Clearing the project filter restores the corpus-wide count.
+      await clearFilter.click()
+      await expect.poll(() => countOf(todayChip)).toBe(baselineToday + 3)
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+
+  /**
+   * feat/chip-due-badges (Trent 2026-09-23): the teal completion fill behind
+   * these chips is gone, replaced by two little pills after the total — a
+   * soft indigo "due later today" pill and a solid red "overdue" pill.
+   */
+  test('project and Today chips show due-today/overdue pills with faceted counts', async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const ids: number[] = []
+
+    // Both tasks must still be "today" when the chips are read, in the user's
+    // own zone: one due between now and midnight, one overdue since midnight.
+    // A fixed ±10 minutes broke at both ends of the day — "later today" was
+    // tomorrow after 23:50, and "overdue today" was yesterday before 00:10.
+    // Each is pinned inside today instead: halfway to midnight (at most 10
+    // minutes out), and no earlier than midnight. In the last two minutes of
+    // the day there is no "later today" left that outlasts the test itself,
+    // so it skips rather than assert on a day that ends mid-run.
+    const now = DateTime.now().setZone(TEST_TZ)
+    const tomorrowStart = now.startOf('day').plus({ days: 1 })
+    const leftToday = tomorrowStart.diff(now)
+    test.skip(leftToday.as('minutes') < 2, 'under two minutes of today left')
+    const dueLaterToday = DateTime.min(
+      now.plus({ minutes: 10 }),
+      now.plus({ milliseconds: leftToday.as('milliseconds') / 2 }),
+    )
+    const overdueToday = DateTime.max(now.startOf('day'), now.minus({ minutes: 10 }))
+
+    await loadWithFiltersOpen(page)
+    const chips = page.locator('#dashboard-filter-chips')
+    const workChip = chips.locator('[data-project-chip="3"]')
+    const todayChip = chips.locator('[data-date-chip="today"]')
+
+    // Pill attributes carry the count as their value (like `data-project-chip`
+    // carries the project id) — absent entirely when that count is 0.
+    const pillCount = async (chip: typeof workChip, attr: string) => {
+      const pill = chip.locator(`[${attr}]`)
+      if ((await pill.count()) === 0) return 0
+      return Number(await pill.getAttribute(attr))
+    }
+
+    await expect(workChip).toBeVisible()
+    const baselineWorkDueToday = await pillCount(workChip, 'data-chip-due-today')
+    const baselineWorkOverdue = await pillCount(workChip, 'data-chip-overdue')
+    const baselineTodayOverdue = await pillCount(todayChip, 'data-chip-overdue')
+
+    try {
+      // Project 3 = Work (scripts/seed-test.ts / globalSetup.ts).
+      ids.push(
+        await createTask(page, {
+          title: 'Chip badge test — Work due later today',
+          project_id: 3,
+          due_at: dueLaterToday.toUTC().toISO(),
+        }),
+      )
+      ids.push(
+        await createTask(page, {
+          title: 'Chip badge test — Work overdue today',
+          project_id: 3,
+          due_at: overdueToday.toUTC().toISO(),
+        }),
+      )
+
+      await loadWithFiltersOpen(page)
+
+      await expect(workChip).toBeVisible()
+      await expect
+        .poll(() => pillCount(workChip, 'data-chip-due-today'))
+        .toBe(baselineWorkDueToday + 1)
+      await expect
+        .poll(() => pillCount(workChip, 'data-chip-overdue'))
+        .toBe(baselineWorkOverdue + 1)
+      // Spelled out for screen readers, not just carried by color.
+      await expect(workChip).toHaveAttribute('aria-label', /for today/)
+      await expect(workChip).toHaveAttribute('aria-label', /overdue/)
+
+      // The Today chip's own total already means "due today" — it gets the
+      // overdue pill (this task is both) but never a due-today pill.
+      await expect
+        .poll(() => pillCount(todayChip, 'data-chip-overdue'))
+        .toBe(baselineTodayOverdue + 1)
+      await expect(todayChip.locator('[data-chip-due-today]')).toHaveCount(0)
+    } finally {
+      await deleteTasks(page, ids)
+    }
+  })
+})
+
+/**
+ * `/?project=<id>` — the widget's dashboard-header deep link (native side
+ * built separately, ios/AGENTS.md). Applies the project filter exclusively
+ * and scrolls to top; consumes the param. See `DashboardClient.tsx`'s
+ * `?project=` effect.
+ */
+test.describe('?project=<id> deep link', () => {
+  test('applies the project filter exclusively and scrolls to top', async ({
+    authenticatedPage: page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    // Project 3 = Work (scripts/seed-test.ts / globalSetup.ts). Seeded task 5
+    // ("Review PRs") is in Work; seeded task 1 ("Buy groceries") is in Inbox.
+    await page.goto('/?project=3')
+
+    await expect(page.getByText('Review PRs')).toBeVisible({ timeout: 5000 })
+    await expect(page.getByText('Buy groceries')).toHaveCount(0)
+
+    // The param is consumed.
+    await expect(page).toHaveURL('/')
+
+    // The scroll effect fires — the page lands at (or animates smoothly to) the top.
+    await expect.poll(() => page.evaluate(() => window.scrollY), { timeout: 2000 }).toBe(0)
+  })
+})
+
+/**
+ * The top bar's "N total tasks" pill counts the list the view holds. In Now,
+ * a task behind a project's "+ N more" fold is in the list one tap away, so it
+ * counts. (The Today view, dropped 2026-10-14, stopped at the end of today and
+ * left later tasks out of the number; see `shownTaskCount` in
+ * `DashboardClient.tsx`.)
+ */
+test.describe('Top bar total', () => {
+  async function createTask(page: Page, body: Record<string, unknown>): Promise<number> {
+    const res = await page.request.post('/api/tasks', { data: body })
+    expect(res.ok()).toBeTruthy()
+    return (await res.json()).data.id as number
+  }
+
+  /** The number in the pill's popover ("N total tasks"), then shut it again. */
+  async function readTotal(page: Page): Promise<number> {
+    // The total pill is the popover trigger; the overdue and today pills
+    // beside it are filter buttons, so the group itself is not clicked.
+    await page.getByRole('button', { name: /total tasks? — show breakdown$/ }).click()
+    const line = page.getByText(/^\d+ total tasks$/)
+    await expect(line).toBeVisible()
+    const n = parseInt((await line.innerText()).trim(), 10)
+    await page.keyboard.press('Escape')
+    await expect(line).toHaveCount(0)
+    return n
+  }
+
+  test('counts the tasks behind the folds in Now', async ({ authenticatedPage: page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    const ids: number[] = []
+    await withPreferences(page, { default_grouping: 'project' }, async () => {
+      try {
+        const now = page.getByRole('button', { name: 'Now', exact: true })
+        await waitForPrefsLoaded(page, () => page.goto('/'), now)
+        await expect(now).toHaveAttribute('aria-pressed', 'true')
+        const baseline = await readTotal(page)
+
+        // Due a week out, and undated: neither is relevant now, both fold.
+        const later = await createTask(page, {
+          title: 'Top bar probe next week',
+          due_at: DateTime.now()
+            .setZone(TEST_TZ)
+            .plus({ days: 7 })
+            .set({ hour: 12, minute: 0 })
+            .toUTC()
+            .toISO(),
+        })
+        ids.push(later)
+        ids.push(await createTask(page, { title: 'Top bar probe undated' }))
+        backdateCreated(ids)
+
+        await waitForPrefsLoaded(page, () => page.reload(), now)
+        await expect(page.locator(`#task-row-${later}`)).toHaveCount(0)
+        expect(await readTotal(page)).toBe(baseline + 2)
+      } finally {
+        for (const id of ids) await page.request.delete(`/api/tasks/${id}`)
+      }
+    })
+  })
+})
+
+/**
+ * Deleting from the quick panel is an undo entry like any other, so the top
+ * bar's undo badge counts it at once. The dashboard's single-task delete was
+ * the one action that didn't bump it. The count is this session's, so a fresh
+ * page starts at 0 (`useUndoRedo`).
+ */
+test.describe('Quick panel delete', () => {
+  test.use({ viewport: { width: 1280, height: 900 } })
+
+  test('bumps the undo count', async ({ authenticatedPage: page }) => {
+    const title = uniqueTitle('Undo-count delete probe')
+    const res = await page.request.post('/api/tasks', {
+      data: { title, due_at: new Date(Date.now() - 60 * 60 * 1000).toISOString() },
+    })
+    expect(res.ok()).toBeTruthy()
+    const id = (await res.json()).data.id as number
+    try {
+      await withPreferences(page, { default_grouping: 'unified' }, async () => {
+        const row = page.locator(`#task-row-${id}`)
+        await waitForPrefsLoaded(page, () => page.goto('/'), row)
+        const undo = page.locator('header').getByRole('button', { name: /^Undo/ })
+        await expect(undo).toHaveAccessibleName('Undo')
+
+        await row.evaluate((el) => el.scrollIntoView({ block: 'center' }))
+        const box = (await row.boundingBox())!
+        await row.dblclick({ position: { x: 56, y: box.height - 6 } })
+        const deleted = page.waitForResponse(
+          (r) => r.request().method() === 'DELETE' && r.url().endsWith(`/api/tasks/${id}`),
+        )
+        await page.getByRole('dialog').getByRole('button', { name: 'Delete', exact: true }).click()
+        expect((await deleted).ok()).toBeTruthy()
+        await expect(undo).toHaveAccessibleName('Undo (1 available)')
+      })
+    } finally {
+      await page.request.delete(`/api/tasks/${id}`)
+    }
+  })
+})

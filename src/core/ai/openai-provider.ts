@@ -1,0 +1,219 @@
+/**
+ * OpenAI-compatible API provider
+ *
+ * Direct HTTP calls via the openai npm SDK.
+ * Supports OpenAI, OpenRouter, Ollama, Together, Groq, xAI, Google Gemini,
+ * and any provider implementing the OpenAI chat completions API.
+ *
+ * Supports per-feature API keys and base URLs via FeatureProviderConfig.
+ */
+
+import OpenAI from 'openai'
+import { log } from '@/lib/logger'
+import { logAIActivity } from './activity'
+import { handleQueryError, resolveQueryTimeout } from './sdk'
+import type { AIQueryOptions, AIQueryResult } from './sdk'
+
+/** Cache of OpenAI clients keyed by "apiKey:baseUrl". */
+const clients = new Map<string, OpenAI>()
+
+function getClient(apiKey?: string, baseUrl?: string): OpenAI {
+  const effectiveKey = apiKey || process.env.OPENAI_API_KEY || ''
+  const effectiveBase = baseUrl || process.env.OPENAI_BASE_URL || ''
+  const cacheKey = `${effectiveKey}:${effectiveBase}`
+
+  let client = clients.get(cacheKey)
+  if (!client) {
+    log.debug(
+      'ai',
+      `[openai] creating client (key: ${effectiveKey ? effectiveKey.slice(0, 8) + '...' : 'MISSING'}, baseURL: ${effectiveBase || 'default'})`,
+    )
+    client = new OpenAI({
+      apiKey: effectiveKey || undefined,
+      ...(effectiveBase && { baseURL: effectiveBase }),
+    })
+    clients.set(cacheKey, client)
+  }
+  return client
+}
+
+// Schema name lookup for OpenAI's json_schema response_format (requires a name field)
+const SCHEMA_NAMES: Record<string, string> = {
+  enrich: 'enrichment_result',
+  whats_next: 'whats_next_result',
+  insights: 'insights_result',
+  quick_take: 'quick_take_result',
+}
+
+/**
+ * Did the model stop at its output cap (finish_reason 'length')? Then the
+ * answer is cut off, and a cut-off JSON answer does not parse. Logged when it happens.
+ */
+function detectTruncation(
+  response: OpenAI.ChatCompletion,
+  action: string,
+): { outputTokens: number | undefined; truncated: boolean } {
+  const truncated = response.choices[0]?.finish_reason === 'length'
+  const outputTokens = response.usage?.completion_tokens
+  if (truncated) {
+    log.warn(
+      'ai',
+      `[openai] ${action} output truncated: hit the output cap (out ${outputTokens ?? '?'})`,
+    )
+  }
+  return { outputTokens, truncated }
+}
+
+/**
+ * Execute an AI query via an OpenAI-compatible API.
+ *
+ * Mirrors the interface of apiQuery() from api-provider.ts — same input options,
+ * same output shape. Callers don't need to know which provider is being used.
+ */
+export async function openaiQuery(options: AIQueryOptions): Promise<AIQueryResult> {
+  const {
+    prompt,
+    outputSchema,
+    systemPrompt,
+    model,
+    userId,
+    taskId,
+    action,
+    inputText,
+    timeoutMs: perCallTimeout,
+    providerConfig,
+  } = options
+
+  const startTime = Date.now()
+  const timeoutMs = resolveQueryTimeout(perCallTimeout)
+  let timedOut = false
+
+  try {
+    const openai = getClient(providerConfig?.apiKey, providerConfig?.baseUrl)
+
+    // Build messages array
+    const messages: OpenAI.ChatCompletionMessageParam[] = []
+    if (systemPrompt) {
+      messages.push({ role: 'system', content: systemPrompt })
+    }
+    messages.push({ role: 'user', content: prompt })
+
+    const createParams: OpenAI.ChatCompletionCreateParamsNonStreaming = {
+      model: model,
+      messages,
+    }
+
+    // Structured output via response_format
+    if (outputSchema) {
+      const useStrict = process.env.OPENTASK_AI_OPENAI_STRICT !== 'false'
+      // OpenAI requires the top-level schema to be type: "object". If the schema
+      // is an array (e.g., insights batch), wrap it in an object with a "data" key.
+      const effectiveSchema =
+        outputSchema.type === 'array'
+          ? {
+              type: 'object',
+              properties: { data: outputSchema },
+              required: ['data'],
+              additionalProperties: false,
+            }
+          : outputSchema
+      createParams.response_format = {
+        type: 'json_schema',
+        json_schema: {
+          name: SCHEMA_NAMES[action] || `${action}_result`,
+          schema: effectiveSchema,
+          ...(useStrict ? { strict: true } : {}),
+        },
+      }
+    }
+
+    // maxThinkingTokens is Anthropic-specific — skipped for OpenAI
+
+    log.debug('ai', `[openai] ${action} starting (model: ${model}, timeout: ${timeoutMs}ms)`)
+
+    // Timeout via AbortController
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, timeoutMs)
+
+    let response: OpenAI.ChatCompletion
+    try {
+      response = await openai.chat.completions.create(createParams, {
+        signal: controller.signal,
+      })
+    } finally {
+      clearTimeout(timer)
+    }
+
+    // Extract content from response
+    let structuredOutput: Record<string, unknown> | null = null
+    let textResult: string | null = null
+
+    const content = response.choices[0]?.message?.content
+    if (content) {
+      textResult = content
+      if (outputSchema) {
+        try {
+          let parsed = JSON.parse(content)
+          // Unwrap the object wrapper we added for array schemas
+          if (
+            outputSchema.type === 'array' &&
+            parsed &&
+            typeof parsed === 'object' &&
+            'data' in parsed
+          ) {
+            parsed = parsed.data
+          }
+          structuredOutput = parsed
+        } catch {
+          log.warn('ai', `[openai] ${action}: response content is not valid JSON`)
+        }
+      }
+    }
+
+    const durationMs = Date.now() - startTime
+    const hasOutput = !!(structuredOutput || textResult)
+
+    const { outputTokens, truncated } = detectTruncation(response, action)
+
+    if (!hasOutput) {
+      log.warn('ai', `[openai] ${action} completed but returned no output (${durationMs}ms)`)
+    }
+
+    logAIActivity({
+      user_id: userId,
+      task_id: taskId ?? null,
+      action,
+      status: hasOutput ? 'success' : 'error',
+      input: inputText ?? null,
+      output: structuredOutput ? JSON.stringify(structuredOutput) : textResult,
+      model: model,
+      duration_ms: durationMs,
+      error: hasOutput ? null : 'OpenAI response contained no usable output',
+      provider: 'openai',
+    })
+
+    log.info('ai', `[openai] ${action} completed in ${durationMs}ms (model: ${model})`)
+
+    return {
+      structuredOutput,
+      textResult,
+      durationMs,
+      success: hasOutput,
+      error: hasOutput ? null : 'No output',
+      outputTokens,
+      truncated,
+    }
+  } catch (err) {
+    return handleQueryError(err, startTime, timedOut, {
+      userId,
+      taskId,
+      action,
+      inputText,
+      model: model,
+      provider: 'openai',
+    })
+  }
+}

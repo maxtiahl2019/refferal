@@ -1,0 +1,574 @@
+/**
+ * Quotas surface API integration tests (REDESIGN-V03 §5)
+ *
+ * GET /api/quotas is the sibling of GET /api/reminders. It exists so the Quotas
+ * surface can refresh on every sync event without pulling the whole task list:
+ * a +1 emits a sync event, so this is the hot path for the gesture the surface
+ * exists for. These tests pin the narrowing — if the endpoint ever starts
+ * returning ordinary tasks the payload regression is silent in the UI, which
+ * renders the same eight rows either way.
+ */
+
+import { describe, test, expect, beforeEach } from 'vitest'
+import { apiFetch, apiFetchB, apiAnon, resetTestData } from './helpers'
+
+describe('Quotas surface API', () => {
+  beforeEach(async () => {
+    await resetTestData()
+  })
+
+  test('GET requires auth', async () => {
+    const res = await apiAnon('/api/quotas')
+    expect(res.status).toBe(401)
+  })
+
+  test('returns quotas only — never ordinary tasks or reminders', async () => {
+    const quota = (
+      await (
+        await apiFetch('/api/tasks', {
+          method: 'POST',
+          body: { title: 'Workouts', progress_target: 4, rrule: 'FREQ=WEEKLY' },
+        })
+      ).json()
+    ).data
+    // A target of 1 is still a quota when the flag says so ("date night").
+    const flagged = (
+      await (
+        await apiFetch('/api/tasks', {
+          method: 'POST',
+          body: { title: 'Date night', is_tracked: true, rrule: 'FREQ=MONTHLY' },
+        })
+      ).json()
+    ).data
+    const plain = (
+      await (
+        await apiFetch('/api/tasks', {
+          method: 'POST',
+          body: { title: 'An ordinary task', due_at: new Date().toISOString() },
+        })
+      ).json()
+    ).data
+    const reminder = (
+      await (
+        await apiFetch('/api/tasks', {
+          method: 'POST',
+          body: { title: 'A reminder', is_reminder: true, rrule: 'FREQ=DAILY' },
+        })
+      ).json()
+    ).data
+
+    const res = await apiFetch('/api/quotas')
+    expect(res.status).toBe(200)
+    const data = (await res.json()).data
+
+    const ids = data.quotas.map((q: { id: number }) => q.id)
+    expect(ids).toContain(quota.id)
+    expect(ids).toContain(flagged.id)
+    expect(ids).not.toContain(plain.id)
+    expect(ids).not.toContain(reminder.id)
+    expect(data.total).toBe(ids.length)
+    expect(data.has_any).toBe(true)
+  })
+
+  test('every returned row really is tracked, and none are done', async () => {
+    await apiFetch('/api/tasks', {
+      method: 'POST',
+      body: { title: 'Reading', progress_target: 3, rrule: 'FREQ=WEEKLY' },
+    })
+
+    const res = await apiFetch('/api/quotas')
+    expect(res.status).toBe(200)
+    const data = (await res.json()).data
+    expect(data.quotas.length).toBeGreaterThan(0)
+
+    for (const q of data.quotas) {
+      expect(q.is_tracked === true || q.progress_target > 1).toBe(true)
+      expect(q.done).toBe(false)
+      expect(q.is_reminder).toBe(false)
+    }
+  })
+
+  test('a trashed quota drops out', async () => {
+    const created = (
+      await (
+        await apiFetch('/api/tasks', {
+          method: 'POST',
+          body: { title: 'Temporary quota', progress_target: 2, rrule: 'FREQ=WEEKLY' },
+        })
+      ).json()
+    ).data
+    const id = created.id
+
+    const before = (await (await apiFetch('/api/quotas')).json()).data
+    expect(before.quotas.map((q: { id: number }) => q.id)).toContain(id)
+
+    await apiFetch(`/api/tasks/${id}`, { method: 'DELETE' })
+
+    const after = (await (await apiFetch('/api/quotas')).json()).data
+    expect(after.quotas.map((q: { id: number }) => q.id)).not.toContain(id)
+  })
+})
+
+/**
+ * A quota is not a task (§5, Trent 2026-09-08): it has no due date and cannot
+ * be snoozed, and retiring one takes its period rule with it. Pinned over HTTP
+ * because each of these is a route contract an external caller depends on —
+ * the automation API and the iOS app both PATCH tasks.
+ */
+describe('A quota over HTTP has no date and no snooze', () => {
+  beforeEach(async () => {
+    await resetTestData()
+  })
+
+  async function makeQuota(body: Record<string, unknown> = {}) {
+    const res = await apiFetch('/api/tasks', {
+      method: 'POST',
+      body: { title: 'Workouts', progress_target: 4, rrule: 'FREQ=WEEKLY', ...body },
+    })
+    return { status: res.status, body: (await res.json()).data }
+  }
+
+  test('POST /api/tasks never stamps a due date on a quota', async () => {
+    const { status, body } = await makeQuota()
+    expect(status).toBe(201)
+    expect(body.due_at).toBeNull()
+    expect(body.original_due_at).toBeNull()
+    expect(body.occurrence_at).toBeNull()
+  })
+
+  test('POST /api/tasks refuses a quota that is given a due date', async () => {
+    const { status } = await makeQuota({ due_at: new Date().toISOString() })
+    expect(status).toBe(400)
+  })
+
+  test('POST /api/tasks/:id/snooze on a quota is a 400', async () => {
+    const { body: quota } = await makeQuota()
+    const res = await apiFetch(`/api/tasks/${quota.id}/snooze`, {
+      method: 'POST',
+      body: { until: new Date(Date.now() + 3_600_000).toISOString() },
+    })
+    expect(res.status).toBe(400)
+  })
+
+  test('PATCH converting a dated task into a quota clears the date', async () => {
+    const created = (
+      await (
+        await apiFetch('/api/tasks', {
+          method: 'POST',
+          body: { title: 'Becomes a quota', due_at: new Date().toISOString() },
+        })
+      ).json()
+    ).data
+    expect(created.due_at).not.toBeNull()
+
+    const res = await apiFetch(`/api/tasks/${created.id}`, {
+      method: 'PATCH',
+      body: { is_tracked: true, progress_target: 3, rrule: 'FREQ=WEEKLY' },
+    })
+    expect(res.status).toBe(200)
+    const patched = (await res.json()).data
+    expect(patched.due_at).toBeNull()
+    expect(patched.original_due_at).toBeNull()
+  })
+
+  test('POST /api/tasks/bulk/edit retiring a quota clears its period rule', async () => {
+    const { body: one } = await makeQuota({ title: 'Quota one' })
+    const { body: two } = await makeQuota({ title: 'Quota two' })
+
+    const res = await apiFetch('/api/tasks/bulk/edit', {
+      method: 'POST',
+      body: { ids: [one.id, two.id], changes: { is_tracked: false, progress_target: 1 } },
+    })
+    expect(res.status).toBe(200)
+
+    for (const id of [one.id, two.id]) {
+      const after = (await (await apiFetch(`/api/tasks/${id}`)).json()).data
+      expect(after.is_tracked).toBe(false)
+      expect(after.rrule).toBeNull()
+      expect(after.due_at).toBeNull()
+    }
+  })
+
+  test('GET /api/tasks/counts does not count quotas at all', async () => {
+    const before = (await (await apiFetch('/api/tasks/counts')).json()).data
+    await makeQuota({ title: 'Uncounted quota' })
+    const after = (await (await apiFetch('/api/tasks/counts')).json()).data
+    expect(after).toEqual(before)
+  })
+})
+
+/**
+ * Review findings, 2026-09-08 — the two that are contracts an HTTP caller sees.
+ */
+describe('Quota review fixes over HTTP', () => {
+  beforeEach(async () => {
+    await resetTestData()
+  })
+
+  test('retiring a quota then undoing it is a 200, not a wedged stack', async () => {
+    const quota = (
+      await (
+        await apiFetch('/api/tasks', {
+          method: 'POST',
+          // The flag explicitly, so `is_tracked` reaches the undo snapshot's
+          // fieldsChanged — the field the allowlist used to throw on.
+          body: { title: 'Date night', is_tracked: true, rrule: 'FREQ=MONTHLY' },
+        })
+      ).json()
+    ).data
+
+    const retired = await apiFetch(`/api/tasks/${quota.id}`, {
+      method: 'PATCH',
+      body: { is_tracked: false },
+    })
+    expect(retired.status).toBe(200)
+
+    const undo = await apiFetch('/api/undo', { method: 'POST' })
+    expect(undo.status).toBe(200)
+
+    const after = (await (await apiFetch(`/api/tasks/${quota.id}`)).json()).data
+    expect(after.is_tracked).toBe(true)
+    expect(after.rrule).toBe('FREQ=MONTHLY')
+
+    // The stack is not wedged: a second Undo consumes the entry BELOW this
+    // one (the create) rather than hitting the same failed row again.
+    const second = await apiFetch('/api/undo', { method: 'POST' })
+    expect(second.status).toBe(200)
+  })
+
+  test("a quota's response carries its period anchor", async () => {
+    const quota = (
+      await (
+        await apiFetch('/api/tasks', {
+          method: 'POST',
+          body: { title: 'Workouts', progress_target: 4, rrule: 'FREQ=WEEKLY' },
+        })
+      ).json()
+    ).data
+
+    // Present, and stamped as the quota is made (2026-10-16) — the iOS Track
+    // widget needs this field, not due_at, to know how far through its
+    // period a quota is.
+    expect(quota).toHaveProperty('progress_period_start')
+    expect(quota.progress_period_start).not.toBeNull()
+    expect(quota.due_at).toBeNull()
+
+    const fetched = (await (await apiFetch(`/api/tasks/${quota.id}`)).json()).data
+    expect(fetched).toHaveProperty('progress_period_start')
+
+    const listed = (await (await apiFetch('/api/quotas')).json()).data.quotas
+    expect(listed.find((q: { id: number }) => q.id === quota.id)).toHaveProperty(
+      'progress_period_start',
+    )
+  })
+})
+
+/**
+ * §7.2, second review finding 1: a label typed while editing SEVERAL quotas
+ * goes through `POST /api/tasks/bulk/edit`, which writes `labels` as raw SQL
+ * and never registered it. The rows carried the name and the registry had never
+ * heard of it, so the next editor did not offer the chip.
+ */
+describe('Bulk edit registers a new label', () => {
+  beforeEach(async () => {
+    await resetTestData()
+  })
+
+  async function makeQuota(title: string) {
+    return (
+      await (
+        await apiFetch('/api/tasks', {
+          method: 'POST',
+          body: { title, progress_target: 3, rrule: 'FREQ=WEEKLY' },
+        })
+      ).json()
+    ).data
+  }
+
+  const labelNames = async () =>
+    ((await (await apiFetch('/api/labels')).json()).data.labels as { name: string }[]).map(
+      (l) => l.name,
+    )
+
+  test('create_label on bulk/edit puts the name in the registry', async () => {
+    const one = await makeQuota('Quota one')
+    const two = await makeQuota('Quota two')
+    const fresh = `probe-${Date.now()}`
+    expect(await labelNames()).not.toContain(fresh)
+
+    const res = await apiFetch('/api/tasks/bulk/edit', {
+      method: 'POST',
+      body: { ids: [one.id, two.id], changes: { labels: [fresh], create_label: true } },
+    })
+    expect(res.status).toBe(200)
+
+    // Both rows carry it...
+    for (const id of [one.id, two.id]) {
+      const after = (await (await apiFetch(`/api/tasks/${id}`)).json()).data
+      expect(after.labels).toContain(fresh)
+    }
+    // ...and so does the registry, so the next editor offers the chip.
+    expect(await labelNames()).toContain(fresh)
+  })
+
+  test('labels_add registers too', async () => {
+    const one = await makeQuota('Quota three')
+    const fresh = `probe-add-${Date.now()}`
+
+    const res = await apiFetch('/api/tasks/bulk/edit', {
+      method: 'POST',
+      body: { ids: [one.id], changes: { labels_add: [fresh], create_label: true } },
+    })
+    expect(res.status).toBe(200)
+    expect(await labelNames()).toContain(fresh)
+  })
+
+  test('a caller that omits the flag is still accepted, as before', async () => {
+    // This endpoint has never validated labels. Registering on the flag must
+    // not turn every existing caller's unknown label into a rejection.
+    const one = await makeQuota('Quota four')
+    const res = await apiFetch('/api/tasks/bulk/edit', {
+      method: 'POST',
+      body: { ids: [one.id], changes: { labels: [`unregistered-${Date.now()}`] } },
+    })
+    expect(res.status).toBe(200)
+  })
+})
+
+describe('POST /api/tasks/:id/undone on a quota', () => {
+  beforeEach(async () => {
+    await resetTestData()
+  })
+
+  test('is refused — a quota completion is a closed period, not a tap to put back', async () => {
+    const quota = (
+      await (
+        await apiFetch('/api/tasks', {
+          method: 'POST',
+          body: { title: 'Undone probe', progress_target: 2, rrule: 'FREQ=WEEKLY' },
+        })
+      ).json()
+    ).data
+    const res = await apiFetch(`/api/tasks/${quota.id}/undone`, { method: 'POST' })
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toMatch(/quota/i)
+  })
+})
+
+/**
+ * A quota always has a period (Trent, 2026-09-25; QUOTA_PERIOD_MESSAGE).
+ * With no period there is no boundary, so its count never resets and its
+ * prompt, once met, never returns. Create, PATCH and bulk edit all refuse one.
+ */
+describe('A quota needs a period', () => {
+  beforeEach(async () => {
+    await resetTestData()
+  })
+
+  async function create(body: Record<string, unknown>) {
+    return (await (await apiFetch('/api/tasks', { method: 'POST', body })).json()).data
+  }
+
+  async function expectPeriodRefusal(res: Response) {
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toMatch(/quota needs a period/i)
+  }
+
+  test('POST /api/tasks refuses a quota without a period, by flag or by target', async () => {
+    for (const body of [
+      { title: 'Loose count', is_tracked: true },
+      { title: 'Loose count', progress_target: 3 },
+    ]) {
+      await expectPeriodRefusal(await apiFetch('/api/tasks', { method: 'POST', body }))
+    }
+  })
+
+  test('a quota from words with AI off is refused, saying to send rrule or turn AI on (2026-10-24)', async () => {
+    const res = await apiFetch('/api/tasks', {
+      method: 'POST',
+      body: { title: 'eggs twice a week', is_tracked: true },
+    })
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toMatch(/quota needs a period.*turn on AI enrichment/i)
+  })
+
+  test('wait: true with no enrichment to wait for answers at once, ai.status skipped (2026-10-24)', async () => {
+    const res = await apiFetch('/api/tasks', {
+      method: 'POST',
+      body: {
+        title: 'Lift',
+        is_tracked: true,
+        progress_target: 3,
+        rrule: 'FREQ=WEEKLY',
+        wait: true,
+      },
+    })
+    expect(res.status).toBe(201)
+    const { data } = await res.json()
+    expect(data).toMatchObject({ title: 'Lift', progress_target: 3, rrule: 'FREQ=WEEKLY' })
+    expect(data.ai).toEqual({ status: 'skipped', description: null })
+
+    // Without wait the response is as before: no `ai` field.
+    const plain = await create({ title: 'Plain wait probe' })
+    expect(plain).not.toHaveProperty('ai')
+  })
+
+  test("PATCH /api/tasks/:id refuses clearing a quota's rule, and making a period-less quota", async () => {
+    const quota = await create({ title: 'Period probe', progress_target: 3, rrule: 'FREQ=WEEKLY' })
+    await expectPeriodRefusal(
+      await apiFetch(`/api/tasks/${quota.id}`, { method: 'PATCH', body: { rrule: null } }),
+    )
+    const after = (await (await apiFetch(`/api/tasks/${quota.id}`)).json()).data
+    expect(after.rrule).toBe('FREQ=WEEKLY')
+
+    const plain = await create({ title: 'Plain probe' })
+    await expectPeriodRefusal(
+      await apiFetch(`/api/tasks/${plain.id}`, {
+        method: 'PATCH',
+        body: { is_tracked: true, progress_target: 3 },
+      }),
+    )
+  })
+
+  test('POST /api/tasks/bulk/edit refuses the whole batch when it would clear a quota rule', async () => {
+    const quota = await create({
+      title: 'Bulk period probe',
+      progress_target: 3,
+      rrule: 'FREQ=WEEKLY',
+    })
+    const plain = await create({
+      title: 'Bulk plain probe',
+      rrule: 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0',
+    })
+
+    await expectPeriodRefusal(
+      await apiFetch('/api/tasks/bulk/edit', {
+        method: 'POST',
+        body: { ids: [quota.id, plain.id], changes: { rrule: null } },
+      }),
+    )
+    // All or nothing: the plain task kept its rule too.
+    const plainAfter = (await (await apiFetch(`/api/tasks/${plain.id}`)).json()).data
+    expect(plainAfter.rrule).toBe('FREQ=DAILY;BYHOUR=9;BYMINUTE=0')
+    const quotaAfter = (await (await apiFetch(`/api/tasks/${quota.id}`)).json()).data
+    expect(quotaAfter.rrule).toBe('FREQ=WEEKLY')
+  })
+})
+
+describe('GET /api/tasks/:id/quota-stats', () => {
+  beforeEach(async () => {
+    await resetTestData()
+  })
+
+  async function create(body: Record<string, unknown>) {
+    return (await (await apiFetch('/api/tasks', { method: 'POST', body })).json()).data
+  }
+
+  test("a new quota's record is all zeros", async () => {
+    const quota = await create({ title: 'Workouts', progress_target: 4, rrule: 'FREQ=WEEKLY' })
+    const res = await apiFetch(`/api/tasks/${quota.id}/quota-stats`)
+    expect(res.status).toBe(200)
+    expect((await res.json()).data).toEqual({
+      periods_met: 0,
+      periods_missed: 0,
+      current_streak: 0,
+      longest_streak: 0,
+      last_logged_at: null,
+    })
+  })
+
+  test('refuses anonymous callers, a plain task, and another user', async () => {
+    const quota = await create({ title: 'Workouts', progress_target: 4, rrule: 'FREQ=WEEKLY' })
+    const plain = await create({ title: 'An ordinary task' })
+    expect((await apiAnon(`/api/tasks/${quota.id}/quota-stats`)).status).toBe(401)
+    expect((await apiFetch(`/api/tasks/${plain.id}/quota-stats`)).status).toBe(400)
+    expect((await apiFetchB(`/api/tasks/${quota.id}/quota-stats`)).status).toBe(403)
+    expect((await apiFetch('/api/tasks/999999/quota-stats')).status).toBe(404)
+  })
+})
+
+/**
+ * Interval quotas (2026-10-16): "every 2 weeks". The period is served on the
+ * task (and its prompt) so no client re-derives it; the INTERVAL is capped
+ * for a quota; a period edit re-anchors and undo puts the old period back.
+ */
+describe('Interval quotas', () => {
+  beforeEach(async () => {
+    await resetTestData()
+  })
+
+  async function create(body: Record<string, unknown>) {
+    const res = await apiFetch('/api/tasks', { method: 'POST', body })
+    return { status: res.status, body: await res.json() }
+  }
+
+  test('POST with FREQ=WEEKLY;INTERVAL=2 serves the period: end, last day, "by …"', async () => {
+    const { status, body } = await create({
+      title: 'Deep-clean the oven',
+      is_tracked: true,
+      rrule: 'FREQ=WEEKLY;INTERVAL=2',
+    })
+    expect(status).toBe(201)
+    const id = body.data.id
+    const task = (await (await apiFetch(`/api/tasks/${id}`)).json()).data
+    expect(task.progress_period_start).not.toBeNull()
+    expect(task.period_interval).toBe(2)
+    expect(task.period_label).toMatch(/^by [A-Z][a-z]{2} \d{1,2}$/)
+    expect(Date.parse(task.progress_period_end)).toBeGreaterThan(Date.now())
+    expect(task.period_last_day).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+
+    const reminders = (await (await apiFetch('/api/reminders')).json()).data
+    const prompt = reminders.groups
+      .flatMap((g: { prompts: { task_id: number }[] }) => g.prompts)
+      .find((p: { task_id: number }) => p.task_id === id)
+    expect(prompt).toMatchObject({
+      period: 'WEEKLY',
+      period_interval: 2,
+      period_label: task.period_label,
+      period_end: task.progress_period_end,
+    })
+  })
+
+  test('an interval-1 quota serves no label (clients keep "this week")', async () => {
+    const { body } = await create({ title: 'Run', is_tracked: true, rrule: 'FREQ=WEEKLY' })
+    expect(body.data.period_interval).toBe(1)
+    expect(body.data.period_label).toBeNull()
+  })
+
+  test('the INTERVAL cap is a 400 on create and on PATCH', async () => {
+    for (const rrule of [
+      'FREQ=WEEKLY;INTERVAL=13',
+      'FREQ=DAILY;INTERVAL=31',
+      'FREQ=YEARLY;INTERVAL=2',
+    ]) {
+      const { status } = await create({ title: 'Too long', is_tracked: true, rrule })
+      expect(status, rrule).toBe(400)
+    }
+    const { body } = await create({ title: 'Ok', is_tracked: true, rrule: 'FREQ=MONTHLY' })
+    const res = await apiFetch(`/api/tasks/${body.data.id}`, {
+      method: 'PATCH',
+      body: { rrule: 'FREQ=MONTHLY;INTERVAL=13', is_tracked: true },
+    })
+    expect(res.status).toBe(400)
+  })
+
+  test('PATCH weekly → every 3 months re-anchors; undo restores the rule and the anchor', async () => {
+    const { body } = await create({ title: 'Swap filters', is_tracked: true, rrule: 'FREQ=WEEKLY' })
+    const before = body.data
+    const patched = await apiFetch(`/api/tasks/${before.id}`, {
+      method: 'PATCH',
+      // A bare period rule needs the tracked flag beside it (as the editor sends it).
+      body: { rrule: 'FREQ=MONTHLY;INTERVAL=3', is_tracked: true },
+    })
+    expect(patched.status).toBe(200)
+    const after = (await patched.json()).data
+    expect(after.period_interval).toBe(3)
+    expect(after.period_label).toMatch(/^by /)
+
+    expect((await apiFetch('/api/undo', { method: 'POST' })).status).toBe(200)
+    const undone = (await (await apiFetch(`/api/tasks/${before.id}`)).json()).data
+    expect(undone.rrule).toBe('FREQ=WEEKLY')
+    expect(undone.progress_period_start).toBe(before.progress_period_start)
+  })
+})

@@ -1,0 +1,55 @@
+/**
+ * Undo History API route
+ *
+ * GET /api/undo/history - Get recent undo history
+ */
+
+import { NextRequest } from 'next/server'
+import { getAuthUser, AuthError } from '@/core/auth'
+import { success, unauthorized, badRequest, handleError } from '@/lib/api-response'
+import { getUndoHistory } from '@/core/undo'
+import { log } from '@/lib/logger'
+import { withLogging } from '@/lib/with-logging'
+
+export const GET = withLogging(async function GET(request: NextRequest) {
+  try {
+    const user = await getAuthUser(request)
+    if (!user) {
+      return unauthorized()
+    }
+
+    const { searchParams } = new URL(request.url)
+    let limit = 50
+    if (searchParams.has('limit')) {
+      limit = parseInt(searchParams.get('limit')!)
+      if (isNaN(limit) || limit < 1) {
+        return badRequest('Invalid limit parameter')
+      }
+    }
+
+    const history = getUndoHistory(user.id, limit)
+
+    return success({
+      history: history.map((entry) => ({
+        id: entry.id,
+        action: entry.action,
+        description: entry.description,
+        tasks_affected: entry.snapshot.length,
+        created_at: entry.created_at,
+        undone: entry.undone,
+        fields_changed: entry.fields_changed,
+        snapshot: entry.snapshot,
+        // Client attribution: which client made the write, and its token's name.
+        client: entry.client,
+        token_name: entry.token_name,
+      })),
+      count: history.length,
+    })
+  } catch (err) {
+    if (err instanceof AuthError) {
+      return unauthorized(err.message)
+    }
+    log.error('api', 'GET /api/undo/history error:', err)
+    return handleError(err)
+  }
+})

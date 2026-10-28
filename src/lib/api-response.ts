@@ -1,0 +1,141 @@
+/**
+ * API response utilities for consistent error handling
+ */
+
+import { NextResponse } from 'next/server'
+import { AppError } from '@/core/errors'
+import type { ErrorCode } from '@/types'
+import { AI_SHELVED_MESSAGE } from '@/core/ai/shelved'
+
+/**
+ * Create a successful JSON response
+ */
+export function success<T>(data: T, status: number = 200): NextResponse {
+  return NextResponse.json({ data }, { status })
+}
+
+/**
+ * Create an error JSON response
+ */
+export function error(
+  message: string,
+  code: ErrorCode,
+  status: number,
+  details?: Record<string, unknown>,
+): NextResponse {
+  return NextResponse.json(
+    {
+      error: message,
+      code,
+      details,
+    },
+    { status },
+  )
+}
+
+/**
+ * 400 Bad Request - validation errors, invalid input
+ */
+export function badRequest(message: string, details?: Record<string, unknown>): NextResponse {
+  return error(message, 'VALIDATION_ERROR', 400, details)
+}
+
+/**
+ * 401 Unauthorized - authentication required
+ */
+export function unauthorized(message: string = 'Authentication required'): NextResponse {
+  return error(message, 'UNAUTHORIZED', 401)
+}
+
+/**
+ * 403 Forbidden - authenticated but not allowed
+ */
+export function forbidden(message: string = 'Access denied'): NextResponse {
+  return error(message, 'FORBIDDEN', 403)
+}
+
+/**
+ * 404 Not Found
+ */
+export function notFound(message: string, details?: Record<string, unknown>): NextResponse {
+  return error(message, 'NOT_FOUND', 404, details)
+}
+
+/**
+ * 409 Conflict - e.g., stale review session
+ */
+export function conflict(message: string, details?: Record<string, unknown>): NextResponse {
+  return error(message, 'CONFLICT', 409, details)
+}
+
+/**
+ * 503 Service Unavailable - feature disabled or temporarily unavailable
+ */
+export function serviceUnavailable(message: string = 'Service unavailable'): NextResponse {
+  return error(message, 'SERVICE_UNAVAILABLE', 503)
+}
+
+/**
+ * 410 Gone - a shelved feature (2026-10-22: What's Next, Insights and Quick
+ * Take, behind `OPENTASK_AI_UNSHELVE`; see src/core/ai/shelved.ts). The one
+ * response every shelved endpoint gives, body exactly
+ * `{ "error": "What's Next, Insights and Quick Take are shelved", "code": "FEATURE_SHELVED" }`.
+ * 410, not 503: the feature is gone on purpose, not briefly unavailable, so a
+ * client should stop asking rather than retry.
+ */
+export function featureShelved(): NextResponse {
+  return error(AI_SHELVED_MESSAGE, 'FEATURE_SHELVED', 410)
+}
+
+/**
+ * 500 Internal Server Error
+ */
+export function internalError(message: string = 'Internal server error'): NextResponse {
+  return error(message, 'INTERNAL_ERROR', 500)
+}
+
+/**
+ * Parse a numeric `[id]` route segment strictly: digits only, else null.
+ *
+ * `parseInt('12abc')` reads 12, so a typo'd URL would act on task 12. Every
+ * `[id]` route calls this and answers null with `badRequest()` (400), the
+ * same response for a malformed id on every route.
+ */
+export function parseRouteId(raw: string): number | null {
+  return /^\d+$/.test(raw) ? parseInt(raw, 10) : null
+}
+
+/**
+ * Handle Zod validation errors
+ */
+export function handleZodError(err: unknown): NextResponse {
+  if (err && typeof err === 'object' && 'issues' in err) {
+    const zodError = err as { issues: Array<{ path: (string | number)[]; message: string }> }
+    const details: Record<string, string> = {}
+    for (const issue of zodError.issues) {
+      const path = issue.path.join('.')
+      details[path] = issue.message
+    }
+    return badRequest('Validation failed', details)
+  }
+  return badRequest(String(err))
+}
+
+/**
+ * Handle general errors from core operations.
+ *
+ * Typed errors (AppError subclasses) produce deterministic status codes.
+ * Plain Error instances return 500 with a generic message to avoid leaking internals.
+ */
+export function handleError(err: unknown): NextResponse {
+  if (err instanceof AppError) {
+    return error(err.message, err.code, err.statusCode)
+  }
+  if (err instanceof SyntaxError) {
+    return badRequest('Invalid JSON in request body')
+  }
+  if (err instanceof Error) {
+    return internalError('Internal server error')
+  }
+  return internalError('Unknown error')
+}

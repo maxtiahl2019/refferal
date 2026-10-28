@@ -1,0 +1,329 @@
+import WatchKit
+import UserNotifications
+import WatchConnectivity
+import WidgetKit
+
+/// Handles notification actions on Apple Watch.
+///
+/// When a notification mirrors from iPhone to Watch, the Watch app's
+/// UNUserNotificationCenterDelegate handles actions locally instead of
+/// forwarding back to the iPhone (which is unreliable when the phone
+/// is locked/suspended).
+///
+/// Registers the same TASK_REMINDER category and action identifiers as
+/// the iOS AppDelegate so the Watch recognizes mirrored notification actions.
+///
+/// Receives credentials from the iPhone via WatchConnectivity. The Watch has
+/// its own keychain (separate device from iPhone), so App Group keychain
+/// sharing doesn't work across devices. The iPhone sends credentials via
+/// WCSession.updateApplicationContext() and the Watch writes them to its
+/// local keychain.
+class WatchAppDelegate: NSObject, WKApplicationDelegate, UNUserNotificationCenterDelegate, WCSessionDelegate {
+
+    func applicationDidFinishLaunching() {
+        // Simulator-only credential seeding (overnight watch-app build/test,
+        // 2026-09-23). The Watch normally learns serverURL/bearerToken from
+        // the paired iPhone over WatchConnectivity (`session(_:didReceiveApplicationContext:)`
+        // below) — but a watch SIMULATOR is never actually paired to anything,
+        // so that path never fires there. `#if DEBUG` keeps this entirely out
+        // of Release builds (it would be a shipped backdoor otherwise); reading
+        // from `ProcessInfo.environment` rather than a hardcoded string keeps
+        // no server URL or token compiled into the binary at all — both are
+        // injected at launch time (Xcode scheme env vars, or `SIMCTL_CHILD_*`
+        // for `simctl launch`) and never committed. Overwrites unconditionally
+        // when both vars are present, since simulator Keychain state is
+        // disposable and a stale token from a previous run should never win.
+        #if DEBUG
+        seedSimulatorCredentialsIfPresent()
+        #endif
+
+        // Migrate keychain items to kSecAttrAccessibleAfterFirstUnlock so they're
+        // readable from notification actions when the Watch is locked.
+        KeychainHelper.migrateAccessibility(keys: ["serverURL", "bearerToken"])
+
+        UNUserNotificationCenter.current().delegate = self
+        registerNotificationCategories()
+        activateWatchSession()
+        #if DEBUG
+        // The screenshot pipeline (scripts/screenshots/capture-watch-app.sh)
+        // boots a fresh simulator, where this prompt would cover the page
+        // it captures — and neither `simctl privacy` (no notifications
+        // service) nor a scripted tap can answer it. Environment-only, like
+        // the credential seeding above; compiled out of Release.
+        if ProcessInfo.processInfo.environment["OPENTASK_SIM_SKIP_NOTIFICATION_PROMPT"] != "1" {
+            requestNotificationPermission()
+        }
+        #else
+        requestNotificationPermission()
+        #endif
+
+        // Refresh the cached time slots (fire-and-forget) so the slot-snooze
+        // notification actions catch up to any change made elsewhere, without
+        // blocking the initial (cache-only) category registration above on a
+        // network round trip.
+        Task { await refreshSlotActions() }
+    }
+
+    /// Refresh the slot-snooze action list on every foreground too, not just
+    /// launch — slots are user-configurable and the Watch app can stay
+    /// backgrounded for a long time. Mirrors AppDelegate's iOS counterpart;
+    /// unlike iOS there is no delivered-notification cleanup to do here.
+    func applicationDidBecomeActive() {
+        Task { await refreshSlotActions() }
+    }
+
+    #if DEBUG
+    /// See `applicationDidFinishLaunching`'s doc. Never compiled into Release.
+    private func seedSimulatorCredentialsIfPresent() {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["OPENTASK_SIM_SERVER_URL"], !url.isEmpty,
+              let token = env["OPENTASK_SIM_TOKEN"], !token.isEmpty
+        else { return }
+        KeychainHelper.save(key: "serverURL", value: url)
+        KeychainHelper.save(key: "bearerToken", value: token)
+        print("[OpenTaskWatch] DEBUG: seeded simulator credentials for \(url)")
+    }
+    #endif
+
+    // MARK: - APNs Registration
+
+    /// Request notification permission and register for remote notifications.
+    /// The Watch gets its own APNs device token, separate from the iPhone.
+    /// This allows the server to send notifications directly to the Watch,
+    /// so the Watch app handles actions locally instead of relying on
+    /// iPhone mirroring (which doesn't route actions to the Watch app).
+    private func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(
+            options: [.alert, .badge, .sound]
+        ) { granted, error in
+            if let error = error {
+                print("[OpenTaskWatch] Notification permission error: \(error)")
+                return
+            }
+            if granted {
+                DispatchQueue.main.async {
+                    WKApplication.shared().registerForRemoteNotifications()
+                }
+            }
+        }
+    }
+
+    func didRegisterForRemoteNotifications(withDeviceToken deviceToken: Data) {
+        let token = deviceToken.map { String(format: "%02.2hhx", $0) }.joined()
+        print("[OpenTaskWatch] APNs token: \(token)")
+
+        guard APIClient.shared.isConfigured else {
+            print("[OpenTaskWatch] Not configured — skipping device registration")
+            return
+        }
+
+        let bundleId = Bundle.main.bundleIdentifier ?? "io.mcnitt.opentask.watchapp"
+        Task {
+            do {
+                try await APIClient.shared.registerDevice(token: token, bundleId: bundleId)
+                print("[OpenTaskWatch] Device registered with server")
+            } catch {
+                print("[OpenTaskWatch] Device registration failed: \(error)")
+            }
+        }
+    }
+
+    func didFailToRegisterForRemoteNotificationsWithError(_ error: Error) {
+        print("[OpenTaskWatch] APNs registration failed: \(error)")
+    }
+
+    // MARK: - Silent Push (Cross-Device Dismiss)
+
+    /// When a task is actioned on another device (iPhone, web), the server sends
+    /// a silent push to all devices so they can clear the matching notification.
+    /// Same pattern as AppDelegate.swift on iOS.
+    func didReceiveRemoteNotification(
+        _ userInfo: [AnyHashable: Any],
+        fetchCompletionHandler completionHandler: @escaping (WKBackgroundFetchResult) -> Void
+    ) {
+        guard let type = userInfo["type"] as? String else {
+            completionHandler(.noData)
+            return
+        }
+
+        // Every silent push the server sends this app means "something
+        // changed elsewhere": `dismiss` goes out on every done/snooze/edit/
+        // delete from any device (`dismissNotificationsForTasks`,
+        // src/core/notifications/dismiss.ts), `dismiss-all` when the app is
+        // opened on another device. That is exactly the Smart Stack's stale
+        // case (checked off on the phone, card still says overdue), so ask
+        // WidgetKit to re-run the card's timeline — its provider fetches
+        // fresh data itself. Works below watchOS 26 too, where WidgetKit
+        // push doesn't exist; on 26 it's a second path next to
+        // `WatchWidgetPushHandler`. Best-effort: Apple budgets background
+        // silent pushes and may drop or delay them.
+        if type == "dismiss" || type == "dismiss-all" {
+            WidgetCenter.shared.reloadTimelines(ofKind: WatchWidgetState.kind)
+        }
+
+        let center = UNUserNotificationCenter.current()
+
+        // Dismiss-all: user opened the app on another device, clear everything
+        if type == "dismiss-all" {
+            center.removeAllDeliveredNotifications()
+            print("[OpenTaskWatch] Dismiss-all: cleared all delivered notifications")
+            completionHandler(.newData)
+            return
+        }
+
+        // Dismiss specific tasks
+        guard type == "dismiss",
+              let taskIds = userInfo["taskIds"] as? [Int], !taskIds.isEmpty else {
+            completionHandler(.noData)
+            return
+        }
+        // With `promptKeys`, a quota-prompt banner closes only by its key.
+        let promptKeys = userInfo[QuotaNagKey.dismissPromptKeys] as? [String]
+
+        Task {
+            let removed = await removeDeliveredNotifications(forTaskIds: taskIds, promptKeys: promptKeys)
+            if removed > 0 {
+                print("[OpenTaskWatch] Dismissed \(removed) notifications for tasks \(taskIds)")
+            }
+            completionHandler(removed == 0 ? .noData : .newData)
+        }
+    }
+
+    // MARK: - WatchConnectivity
+
+    private func activateWatchSession() {
+        guard WCSession.isSupported() else { return }
+        WCSession.default.delegate = self
+        WCSession.default.activate()
+    }
+
+    func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
+        if let error = error {
+            print("[OpenTaskWatch] WCSession activation failed: \(error)")
+        }
+    }
+
+    /// Receive credentials from iPhone and save to local keychain.
+    func session(_ session: WCSession, didReceiveApplicationContext applicationContext: [String: Any]) {
+        guard let url = applicationContext["serverURL"] as? String,
+              let token = applicationContext["bearerToken"] as? String else { return }
+
+        KeychainHelper.save(key: "serverURL", value: url)
+        KeychainHelper.save(key: "bearerToken", value: token)
+        print("[OpenTaskWatch] Credentials received from iPhone")
+    }
+
+    // MARK: - Notification Categories (delegated to Shared/NotificationConstants.swift)
+
+    // MARK: - Handle Notification Actions
+
+    /// Called when the user taps a notification action button on the Watch.
+    /// Makes API calls directly from the Watch — no forwarding to iPhone.
+    ///
+    /// The server call and the banner removal are `NotificationActionRunner`,
+    /// shared with the phone, the Mac and the content extension. This keeps
+    /// the Watch's part: haptics (success, or failure for a "Complete all"
+    /// that completed nothing), a local error banner when a call fails, and
+    /// the not-configured guard. No navigation — a body tap just clears the
+    /// banners — and no badge: watchOS has no app icon badge (the phone and
+    /// Mac re-read theirs from the server after an action,
+    /// `refreshBadgeFromServer`).
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let userInfo = response.notification.request.content.userInfo
+        let categoryId = response.notification.request.content.categoryIdentifier
+
+        // Handle silent dismiss pushes (shouldn't reach here, but guard anyway)
+        if let type = userInfo["type"] as? String, type == "dismiss" {
+            completionHandler()
+            return
+        }
+
+        guard APIClient.shared.isConfigured else {
+            print("[OpenTaskWatch] API not configured — cannot handle action")
+            playHaptic(.failure)
+            postLocalErrorNotification("OpenTask not configured. Open the iOS app to set up.")
+            completionHandler()
+            return
+        }
+
+        Task {
+            do {
+                let outcome = try await NotificationActionRunner.handle(response)
+                print("[OpenTaskWatch] \(categoryId) \(response.actionIdentifier): \(outcome)")
+                switch outcome {
+                // The single click, never a success chime (2026-10-11 —
+                // the app's taps too); a failure keeps its buzz.
+                // A reminder's Considered is a success either way: `false`
+                // only means the server had nothing to do (another day's
+                // banner, or considered elsewhere already).
+                // A quota prompt's Considered likewise: another day's key
+                // (the server's 400) is nothing to do, quietly.
+                case .taskUpdated, .swept, .reminderConsidered, .promptConsidered:
+                    playHaptic(.click)
+                case .promptDid:
+                    playHaptic(.click)
+                    // The Smart Stack card and the complications show the
+                    // count — what the watch app's own did-it does
+                    // (`WatchViewModel.actOnPrompt`).
+                    WidgetCenter.shared.reloadAllTimelines()
+                case .promptDidStale:
+                    // Another day's prompt: nothing was logged. The web's words.
+                    playHaptic(.failure)
+                    postLocalErrorNotification(NotificationActionRunner.staleDidMessage)
+                case .slotCompleted(let affected):
+                    playHaptic(affected > 0 ? .click : .failure)
+                case .ignored, .missingTaskId, .openDashboard, .openTask, .openDeadlines, .openPrompt:
+                    break
+                }
+            } catch {
+                print("[OpenTaskWatch] Action failed: \(error)")
+                playHaptic(.failure)
+                postLocalErrorNotification("Action failed: \(error.localizedDescription)")
+            }
+
+            completionHandler()
+        }
+    }
+
+    /// Suppress notifications when the Watch app is in the foreground.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([])
+    }
+
+    // MARK: - Haptic Feedback
+
+    private func playHaptic(_ type: WKHapticType) {
+        WKInterfaceDevice.current().play(type)
+    }
+
+    // MARK: - Error Notification
+
+    /// Post a local notification so the user knows an action failed.
+    /// Replaces the iPhone app's silent print() failures with visible feedback.
+    private func postLocalErrorNotification(_ message: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "OpenTask"
+        content.body = message
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "opentask-watch-error-\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                print("[OpenTaskWatch] Failed to post error notification: \(error)")
+            }
+        }
+    }
+}
