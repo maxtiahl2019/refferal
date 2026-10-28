@@ -14,6 +14,7 @@ import {
   Gauge,
   BookOpen,
   ListChecks,
+  NotebookPen,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { DOCS_URL } from '@/lib/docs-url'
@@ -49,6 +50,7 @@ export function Sidebar({ onAddClick }: SidebarProps) {
 
   const navItems = [
     { href: '/', label: 'Dashboard', icon: LayoutDashboard },
+    { href: '/notes', label: 'Notes', icon: NotebookPen },
     { href: '/reminders', label: 'Reminders', icon: Lightbulb },
     // §5: quotas are a place, not only the instrument on the dashboard —
     // somewhere to make one, retire one, and see which have never been met.

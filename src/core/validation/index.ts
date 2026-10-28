@@ -74,6 +74,18 @@ export { labelCreateSchema, validateLabelCreate } from './label'
 export type { LabelCreateInput } from './label'
 
 export {
+  NOTE_BODY_MAX,
+  noteCreateSchema,
+  noteUpdateSchema,
+  digestSettingsSchema,
+  validateNoteCreate,
+  validateNoteUpdate,
+  validateDigestSettings,
+} from './note'
+
+export type { NoteCreateInput, NoteUpdateInput, DigestSettingsInput } from './note'
+
+export {
   timeSlotCreateSchema,
   validateTimeSlotCreate,
   timeSlotUpdateSchema,

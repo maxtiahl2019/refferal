@@ -26,6 +26,7 @@
  * - 4:50 AM UTC Sunday: named reminder push records of reminders that are gone
  * - 5:00 AM UTC daily: AI activity purge
  * - 5:30 AM UTC daily: webhook delivery purge
+ * - Every 5 min: email digests (src/core/digest; once per user per local day)
  * - 3:00 AM UTC daily: What's Next generation (§7.4) — SHELVED (2026-10-22)
  * - 3:30 AM UTC daily: Insights generation (§7.4) — SHELVED (2026-10-22)
  *   Both are scheduled only with OPENTASK_AI_UNSHELVE=1 (src/core/ai/shelved.ts).
@@ -301,6 +302,18 @@ export async function register() {
 
     const { purgeOldDeliveries } = await import('@/core/webhooks/purge')
     cron.schedule('30 5 * * *', () => safeCronRun('webhook delivery purge', purgeOldDeliveries))
+
+    // Email digests (src/core/digest): every 5 minutes; each user's daily
+    // digest goes out once per local day at their send time, the weekly one
+    // on Mondays. A no-op while OPENTASK_SMTP_HOST is unset.
+    const { runDigests } = await import('@/core/digest')
+    cron.schedule('*/5 * * * *', async () => {
+      try {
+        await runDigests()
+      } catch (err) {
+        log.error('cron', 'Email digest run error:', err)
+      }
+    })
 
     log.info(
       'cron',

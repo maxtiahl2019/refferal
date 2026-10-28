@@ -20,6 +20,7 @@ import {
   Monitor,
   BookOpen,
   Plus,
+  NotebookPen,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
@@ -433,6 +434,14 @@ function HeaderMenu({
             also the only route to these there — the desktop sidebar
             still lists all three. Archive moved here on 2026-09-06 when
             Quotas took its tab. */}
+        {/* Notes (2026-10-28): the thought inbox. No tab of its own on a
+            phone yet (the five slots are spoken for), so it leads this menu. */}
+        <DropdownMenuItem asChild>
+          <GuardedLink href="/notes">
+            <NotebookPen className="size-4" />
+            Notes
+          </GuardedLink>
+        </DropdownMenuItem>
         <DropdownMenuItem asChild>
           <GuardedLink href="/archive">
             <Archive className="size-4" />

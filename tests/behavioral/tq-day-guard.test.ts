@@ -80,6 +80,15 @@ const NIGHT_HELPER =
 
 /** `file: trimmed line` → [occurrences, reason]. */
 const ALLOWLIST: Record<string, [number, string]> = {
+  // ── The email digest's clock (src/core/digest, 2026-10-28) ─────────
+  "src/core/digest/index.ts: return { date: local.toISODate()!, weekday: local.weekday, time: local.toFormat('HH:mm') }":
+    [
+      1,
+      `${DELIBERATE_CALENDAR}: a digest is a clock time, once per calendar day (\`digestClock\`)`,
+    ],
+  'src/core/digest/index.ts: if (row.weekly_enabled === 1 && clock.weekday === 1 && row.last_weekly_date !== clock.date) {':
+    [1, `${DELIBERATE_CALENDAR}: the Monday review, on \`digestClock\`'s calendar weekday`],
+
   // ── Calendar arithmetic on an OpenTask date ─────────────────────────
   'src/components/OnDeckButton.tsx: const tomorrow = DateTime.fromISO(today).plus({ days: 1 }).toFormat(DECK_DAY_FORMAT)':
     [1, `${ON_OPENTASK_DATE} (the deck picker's tomorrow)`],

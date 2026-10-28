@@ -16,6 +16,8 @@ Next.js 16 (App Router) + React 19 + React Compiler + TypeScript + SQLite (bette
 
 Additional docs: `docs/REDESIGN-V03.md` (v0.3 redesign spec, cited as `§N` in code), `docs/SPEC.md` (product requirements), `docs/ROADMAP.md` (planned features), `docs/AUTOMATION.md` (external API integration), `DEV_LOG.md` (design decisions and narrative context), `docs/NOTIFICATIONS.md` (push architecture), `docs/IOS-DEV-LOG.md` (iOS history), `docs/openapi.yaml` (REST API schema), `docs/AI.md` (AI architecture and quality testing), `docs/TASK-MODEL.md` (task model reference), `docs/DESIGN.md` (design philosophy).
 
+**Notes and email digests (2026-10-28, this fork).** `notes` (`src/core/notes`, `/api/notes`, the `/notes` page) is the thought inbox: free text from web / Telegram / email / API, `status` inbox → filed (into a project) → archived, soft-deleted, not in the undo log. `email_digests` (`src/core/digest`, `/api/digest`, Settings → Email digest) sends a daily digest and a Monday review over SMTP (`src/core/email`, `OPENTASK_SMTP_*`), from a 5-minute cron in `src/instrumentation.ts`; a digest is a clock time on the CALENDAR day (`digestClock`, allowlisted in TQ-G01). Tests: `tests/behavioral/notes-digest.test.ts` (NT-_, DG-_).
+
 ### Documentation site
 
 The public docs site lives in a separate repo (`opentask-docs`, typically at `~/working_dir/opentask-docs`) (VitePress, deployed to `opentask.mcnitt.io/docs/`). When you change features, API behavior, or configuration in this repo, the docs site may need a corresponding update. Key sync points:

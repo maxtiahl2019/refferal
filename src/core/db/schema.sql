@@ -739,3 +739,38 @@ CREATE TABLE IF NOT EXISTS segment_roster (
   section  TEXT DEFAULT NULL,
   PRIMARY KEY (user_id, day, kind, task_id)
 );
+
+-- NOTES (2026-10-28): the inbox for raw thoughts. A note is free text the
+-- user drops in from the web, Telegram, email or the API; it starts in the
+-- inbox (`status = 'inbox'`), is filed into a project ('filed') by hand or by
+-- the AI structurer, and can be archived. Soft-deleted via `deleted_at`, like
+-- tasks. Not in the undo log (like projects and labels). A deleted project
+-- leaves its notes unfiled (project_id NULL) rather than taking them with it.
+CREATE TABLE IF NOT EXISTS notes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  project_id INTEGER DEFAULT NULL REFERENCES projects(id) ON DELETE SET NULL,
+  body       TEXT NOT NULL,
+  source     TEXT NOT NULL DEFAULT 'web' CHECK (source IN ('web', 'telegram', 'email', 'api')),
+  status     TEXT NOT NULL DEFAULT 'inbox' CHECK (status IN ('inbox', 'filed', 'archived')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  deleted_at TEXT DEFAULT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notes_user_status ON notes(user_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_notes_project ON notes(project_id);
+
+-- EMAIL DIGESTS (2026-10-28, src/core/digest/): one row per user who has set
+-- an address. The daily digest goes out at `send_time` (HH:MM, the user's
+-- zone) each day, the weekly review at the same time on Mondays. The
+-- last_*_date columns hold the local date (yyyy-MM-dd) of the last send, so
+-- each one goes out exactly once however often the job runs.
+CREATE TABLE IF NOT EXISTS email_digests (
+  user_id          INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  email            TEXT NOT NULL,
+  daily_enabled    INTEGER NOT NULL DEFAULT 1,
+  weekly_enabled   INTEGER NOT NULL DEFAULT 1,
+  send_time        TEXT NOT NULL DEFAULT '08:00',
+  last_daily_date  TEXT DEFAULT NULL,
+  last_weekly_date TEXT DEFAULT NULL
+);

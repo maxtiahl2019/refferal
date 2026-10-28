@@ -5332,6 +5332,219 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /api/notes:
+    get:
+      summary: List notes
+      operationId: listNotes
+      tags: [Notes]
+      description: |
+        The thought inbox (2026-10-28). Newest first. With no `status`, inbox
+        and filed notes; archived notes only when asked for by name.
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [inbox, filed, archived] }
+        - name: project_id
+          in: query
+          schema: { type: integer }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+      responses:
+        '200':
+          description: Notes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      notes:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Note'
+                      count:
+                        type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      summary: Add a note
+      operationId: createNote
+      tags: [Notes]
+      description: A note with a project is filed; without one it lands in the inbox.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, maxLength: 20000 }
+                project_id: { type: [integer, 'null'] }
+                source: { type: string, enum: [web, telegram, email, api], default: api }
+      responses:
+        '201':
+          description: The new note
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Note'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/notes/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      summary: Get a note
+      operationId: getNote
+      tags: [Notes]
+      responses:
+        '200':
+          description: The note
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Note'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      summary: Edit, file or archive a note
+      operationId: updateNote
+      tags: [Notes]
+      description: |
+        Setting `project_id` files the note; `null` returns it to the inbox.
+        An explicit `status` wins (archiving keeps the project).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                body: { type: string, maxLength: 20000 }
+                project_id: { type: [integer, 'null'] }
+                status: { type: string, enum: [inbox, filed, archived] }
+      responses:
+        '200':
+          description: The updated note
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Note'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      summary: Delete a note (soft)
+      operationId: deleteNote
+      tags: [Notes]
+      responses:
+        '200':
+          description: Deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/digest:
+    get:
+      summary: Email digest settings
+      operationId: getDigestSettings
+      tags: [Digest]
+      description: |
+        `settings` is null until the user saves an address. `email_configured`
+        says whether this server can send mail (OPENTASK_SMTP_HOST).
+      responses:
+        '200':
+          description: Settings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      settings:
+                        oneOf:
+                          - $ref: '#/components/schemas/DigestSettings'
+                          - type: 'null'
+                      email_configured:
+                        type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    patch:
+      summary: Create or change the digest settings
+      operationId: saveDigestSettings
+      tags: [Digest]
+      description: Creating the settings needs `email`; later changes may send any subset.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DigestSettings'
+      responses:
+        '200':
+          description: The saved settings
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    delete:
+      summary: Turn digests off
+      operationId: deleteDigestSettings
+      tags: [Digest]
+      responses:
+        '200':
+          description: Turned off
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/digest/send:
+    post:
+      summary: Send a digest now
+      operationId: sendDigestNow
+      tags: [Digest]
+      description: For trying the settings out; the schedule is untouched.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                kind: { type: string, enum: [daily, weekly], default: daily }
+      responses:
+        '200':
+          description: Sent
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -5410,6 +5623,29 @@ components:
                       $ref: '#/components/schemas/Task'
 
   schemas:
+    Note:
+      type: object
+      properties:
+        id: { type: integer }
+        user_id: { type: integer }
+        project_id: { type: [integer, 'null'] }
+        body: { type: string }
+        source: { type: string, enum: [web, telegram, email, api] }
+        status: { type: string, enum: [inbox, filed, archived] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    DigestSettings:
+      type: object
+      properties:
+        email: { type: string, format: email }
+        daily_enabled: { type: boolean }
+        weekly_enabled: { type: boolean }
+        send_time:
+          {
+            type: string,
+            pattern: '^([01]\d|2[0-3]):[0-5]\d$',
+            description: "HH:MM in the user's zone",
+          }
     UserPreferences:
       type: object
       additionalProperties: true

@@ -38,6 +38,9 @@ OpenTask is a self-hosted, AI-powered task and habit manager I built for persona
 
 It runs as a single Docker container with SQLite — no Postgres, no Redis, no external services to manage. Your data lives in one file on your server.
 
+> [!NOTE]
+> **This is a modified fork** of [trentmcnitt/opentask](https://github.com/trentmcnitt/opentask) (AGPL-3.0), extended from 2026-10-28 into a personal project hub. Added so far: a **Notes** inbox for raw thoughts (`/notes`, `/api/notes`) and **email digests** — a daily summary and a Monday project review over SMTP (Settings → Email digest, `OPENTASK_SMTP_*` in `.env.example`).
+
 ## ✨ Features
 
 ### 🗓️ Tasks, reminders, and quotas

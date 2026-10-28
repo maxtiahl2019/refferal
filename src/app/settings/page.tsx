@@ -15,6 +15,7 @@ import { BUILD_ID, VERSION, formatBuildDate } from '@/lib/build-info'
 import { SettingsSection } from '@/components/settings/SettingsSection'
 import { AppearanceSection, PriorityDisplaySection } from '@/components/settings/AppearanceSection'
 import { NotificationsSection } from '@/components/settings/NotificationsSection'
+import { DigestSection } from '@/components/settings/DigestSection'
 import { DeferSection } from '@/components/settings/DeferSection'
 import { YourDaySection } from '@/components/settings/YourDaySection'
 import { NumberPadSection } from '@/components/settings/NumberPadSection'
@@ -104,6 +105,7 @@ export default function SettingsPage() {
 
         <PriorityDisplaySection />
         <NotificationsSection />
+        {!isDemo && <DigestSection />}
         <YourDaySection timeSlots={timeSlots} rowsReady={anchorRowsReady} />
         <ScheduleSection timeSlots={timeSlots} loading={slotsLoading} refresh={refreshSlots} />
         <NumberPadSection timeSlots={timeSlots} rowsReady={anchorRowsReady} />
