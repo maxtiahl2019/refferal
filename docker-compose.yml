@@ -1,8 +1,9 @@
 services:
   opentask:
-    image: ghcr.io/trentmcnitt/opentask:latest
-    # To build from source instead:
-    # build: .
+    # Built from this repository (the fork with notes and email digests), not
+    # the upstream ghcr.io/trentmcnitt/opentask image, which lacks them.
+    build: .
+    image: opentask-local:latest
     ports:
       - '3000:3000'
     volumes:
